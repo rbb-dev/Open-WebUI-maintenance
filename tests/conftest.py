@@ -60,6 +60,7 @@ knowledge_module = types.ModuleType("open_webui.models.knowledge")
 config_module = types.ModuleType("open_webui.config")
 config_module.UPLOAD_DIR = "/tmp"
 starlette_module = types.ModuleType("starlette")
+storage_provider_module = types.ModuleType("open_webui.storage.provider")
 
 
 # Minimal FastAPI/Starlette stubs so the module imports cleanly during tests.
@@ -121,15 +122,30 @@ class DummyChat:
 users_module.Users = DummyUsers
 users_module.User = DummyUser
 chats_module.Chat = DummyChat
+class _FileForm:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
 files_module.File = type("File", (), {})
+files_module.FileForm = _FileForm
 files_module.Files = type(
     "Files",
     (),
     {
         "delete_file_by_id": staticmethod(lambda file_id: bool(file_id)),
+        "insert_new_file": staticmethod(lambda user_id, form: types.SimpleNamespace(id=getattr(form, "id", None))),
     },
 )
 knowledge_module.KnowledgeFile = type("KnowledgeFile", (), {})
+storage_provider_module.Storage = type(
+    "Storage",
+    (),
+    {
+        "upload_file": staticmethod(lambda fileobj, filename, headers: (None, f"/tmp/{filename}")),
+    },
+)
 
 sys.modules.setdefault("open_webui", open_webui_module)
 sys.modules.setdefault("open_webui.internal", internal_module)
@@ -139,6 +155,8 @@ sys.modules.setdefault("open_webui.models.chats", chats_module)
 sys.modules.setdefault("open_webui.models.users", users_module)
 sys.modules.setdefault("open_webui.models.files", files_module)
 sys.modules.setdefault("open_webui.models.knowledge", knowledge_module)
+sys.modules.setdefault("open_webui.storage", types.ModuleType("open_webui.storage"))
+sys.modules.setdefault("open_webui.storage.provider", storage_provider_module)
 sys.modules.setdefault("open_webui.config", config_module)
 sys.modules.setdefault("fastapi", fastapi_module)
 sys.modules.setdefault("fastapi.responses", fastapi_responses)

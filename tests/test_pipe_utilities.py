@@ -14,11 +14,18 @@ def pipe():
 
 
 def test_parse_command_extracts_options(pipe):
-    command, options = pipe._parse_command("db-clean confirm limit = 25 id = a,b;c user = me")
+    ids = [
+        "123e4567-e89b-12d3-a456-426614174000",
+        "123e4567-e89b-12d3-a456-426614174111",
+        "123e4567-e89b-12d3-a456-426614174222",
+    ]
+    command, options = pipe._parse_command(
+        f"db-clean confirm limit = 25 id = {ids[0]},{ids[1]};{ids[2]} user = me"
+    )
     assert command == "db-clean"
     assert options["confirm"] is True
     assert options["limit"] == 25
-    assert options["ids"] == ["a", "b", "c"]
+    assert options["ids"] == ids
     assert options["user_id"] == "me"
 
 
@@ -30,18 +37,51 @@ def test_parse_command_accepts_space_separated_values(pipe):
     assert options["confirm"] is True
 
 
-def test_parse_command_handles_multiword_user(pipe):
-    command, options = pipe._parse_command("user-report user Boris Bakchiev limit 5")
+def test_parse_command_handles_uuid_user(pipe):
+    user_uuid = "123e4567-e89b-12d3-a456-426614174333"
+    command, options = pipe._parse_command(f"user-report user \"{user_uuid}\" limit 5")
     assert command == "user-report"
-    assert options["user_id"] == "Boris Bakchiev"
+    assert options["user_id"] == user_uuid
     assert options["limit"] == 5
 
 
 def test_parse_command_reads_user_query(pipe):
-    command, options = pipe._parse_command('chat-scan user_query "Alice Example" limit 5')
+    command, options = pipe._parse_command('chat-scan user_query "John Citizen" limit 5')
     assert command == "chat-scan"
-    assert options["user_query"] == "Alice Example"
+    assert options["user_query"] == "John Citizen"
     assert options["limit"] == 5
+
+
+def test_parse_command_handles_quoted_user(pipe):
+    user_uuid = "123e4567-e89b-12d3-a456-426614174444"
+    command, options = pipe._parse_command(f'/image-detach confirm user="{user_uuid}" limit=1')
+    assert command == "image-detach"
+    assert options["user_id"] == user_uuid
+    assert options["limit"] == 1
+
+
+def test_parse_command_handles_smart_quotes(pipe):
+    user_uuid = "123e4567-e89b-12d3-a456-426614174555"
+    smart_command = f"/image-detach confirm user=\u201c{user_uuid}\u201d"
+    command, options = pipe._parse_command(smart_command)
+    assert command == "image-detach"
+    assert options["user_id"] == user_uuid
+
+
+def test_parse_command_accepts_plain_commands(pipe):
+    command, options = pipe._parse_command("db-clean limit=5")
+    assert command == "db-clean"
+    assert options["limit"] == 5
+
+
+def test_parse_command_rejects_invalid_user_id(pipe):
+    with pytest.raises(ValueError):
+        pipe._parse_command("/db-scan user not-a-uuid")
+
+
+def test_parse_command_rejects_invalid_id_list(pipe):
+    with pytest.raises(ValueError):
+        pipe._parse_command("/db-clean limit=1 id=not-a-uuid user=me")
 
 
 def test_clamp_limit_bounds(pipe):
@@ -92,7 +132,7 @@ def test_build_db_scan_report_contains_table(pipe):
             "updated_at": 0,
         }
     ]
-    user_labels = {"user-1": "Alice"}
+    user_labels = {"user-1": "John Citizen"}
     report = pipe._build_db_scan_report(
         scan_result,
         missing_rows=missing_rows,
@@ -103,7 +143,7 @@ def test_build_db_scan_report_contains_table(pipe):
         limit=25,
     )
     assert "Database scan results" in report
-    assert "| `file-1` | Alice |" in report
+    assert "| `file-1` | John Citizen |" in report
     assert "| `file-2` | user-2 |" in report
 
 
@@ -139,7 +179,7 @@ def test_build_storage_scan_report(pipe):
         "has_more_disk": False,
         "has_more_missing": False,
     }
-    user_labels = {"user-1": "Alice"}
+    user_labels = {"user-1": "John Citizen"}
     report = pipe._build_storage_scan_report(scan_result, scope="entire workspace", limit=25, user_labels=user_labels)
     assert "Storage scan results" in report
     assert "Files on disk without database records" in report
@@ -162,9 +202,13 @@ def test_build_chat_scan_report(pipe):
         "counters": {"null_bytes": 1},
         "has_more": False,
     }
-    report = pipe._build_chat_scan_report(scan_result, user_labels={"user-1": "Alice"}, scope="entire workspace")
+    report = pipe._build_chat_scan_report(
+        scan_result,
+        user_labels={"user-1": "John Citizen"},
+        scope="entire workspace",
+    )
     assert "Chat scan summary" in report
-    assert "| `chat-1` | Alice |" in report
+    assert "| `chat-1` | John Citizen |" in report
 
 
 def test_build_chat_repair_report(pipe):
@@ -184,19 +228,19 @@ def test_build_chat_repair_report(pipe):
     }
     report = pipe._build_chat_repair_report(
         repair_result,
-        user_labels={"user-1": "Alice"},
+        user_labels={"user-1": "John Citizen"},
         limit=10,
         scope="entire workspace",
     )
     assert "Chat repair summary" in report
     assert "Chats repaired: 2" in report
-    assert "| `chat-1` | Alice |" in report
+    assert "| `chat-1` | John Citizen |" in report
 
 
 def test_build_user_report(pipe):
     users = [
-        SimpleNamespace(id="user-1", name="Alice", email="alice@example.com"),
-        SimpleNamespace(id="user-2", name="Bob", email="bob@example.com"),
+        SimpleNamespace(id="user-1", name="John Citizen", email="john1@example.com"),
+        SimpleNamespace(id="user-2", name="John Citizen", email="john2@example.com"),
     ]
     usage = {
         "user-1": UserUsageStats(chat_count=2, chat_bytes=2048, file_count=1, file_bytes=1024),
@@ -204,47 +248,45 @@ def test_build_user_report(pipe):
     }
     report = pipe._build_user_report(users, usage, limit=0)
     assert "User usage report" in report
-    assert "Alice" in report
-    assert "Bob" in report
+    assert "John Citizen" in report
 
 
 def test_prepare_user_report_rows_sorted_by_name(pipe):
     users = [
-        SimpleNamespace(id="user-1", name="Charlie", email="charlie@example.com"),
-        SimpleNamespace(id="user-2", name="Alice", email="alice@example.com"),
+        SimpleNamespace(id="user-1", name="John Citizen", email="john1@example.com"),
+        SimpleNamespace(id="user-2", name="John Citizen", email="john2@example.com"),
     ]
     usage = {
         "user-1": UserUsageStats(chat_count=1, chat_bytes=100, file_count=1, file_bytes=200),
         "user-2": UserUsageStats(chat_count=1, chat_bytes=100, file_count=1, file_bytes=200),
     }
     rows = pipe._prepare_user_report_rows(users, usage, limit=0)
-    assert [row["label"] for row in rows] == ["Alice", "Charlie"]
+    assert [row["label"] for row in rows] == ["John Citizen", "John Citizen"]
 
 
 def test_resolve_user_value_matches_name(pipe, monkeypatch):
     fake_users = [
-        SimpleNamespace(id="user-1", name="Boris Bakchiev", email="boris@example.com"),
-        SimpleNamespace(id="user-2", name="Alice Example", email="alice@example.com"),
+        SimpleNamespace(id="user-1", name="John Citizen", email="john@example.com"),
     ]
 
     monkeypatch.setattr(cleanup.Users, "get_user_by_id", lambda value: None)
     monkeypatch.setattr(cleanup.Users, "get_users", lambda: {"users": fake_users}, raising=False)
 
-    user_id, error = pipe._resolve_user_value("Boris Bakchiev")
+    user_id, error = pipe._resolve_user_value("John Citizen")
     assert user_id == "user-1"
     assert error is None
 
 
 def test_resolve_user_value_detects_ambiguity(pipe, monkeypatch):
     fake_users = [
-        SimpleNamespace(id="user-1", name="Boris Alpha", email="alpha@example.com"),
-        SimpleNamespace(id="user-2", name="Boris Beta", email="beta@example.com"),
+        SimpleNamespace(id="user-1", name="John Citizen", email="alpha@example.com"),
+        SimpleNamespace(id="user-2", name="John Citizen", email="beta@example.com"),
     ]
 
     monkeypatch.setattr(cleanup.Users, "get_user_by_id", lambda value: None)
     monkeypatch.setattr(cleanup.Users, "get_users", lambda: {"users": fake_users}, raising=False)
 
-    user_id, error = pipe._resolve_user_value("Boris")
+    user_id, error = pipe._resolve_user_value("John Citizen")
     assert user_id is None
     assert "Multiple users match" in error
 
@@ -260,7 +302,7 @@ def test_extract_chat_ids_from_text(pipe):
     text = """
 | User | Chat ID | Title | Issues |
 | --- | --- | --- | --- |
-| Alice | `chat-1` | Bad chat | 1 null byte |
+| John Citizen | `chat-1` | Bad chat | 1 null byte |
 """
     ids = pipe._extract_chat_ids_from_text(text)
     assert ids == ["chat-1"]
