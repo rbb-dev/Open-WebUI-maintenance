@@ -37,6 +37,13 @@ def test_parse_command_handles_multiword_user(pipe):
     assert options["limit"] == 5
 
 
+def test_parse_command_reads_user_query(pipe):
+    command, options = pipe._parse_command('chat-scan user_query "Alice Example" limit 5')
+    assert command == "chat-scan"
+    assert options["user_query"] == "Alice Example"
+    assert options["limit"] == 5
+
+
 def test_clamp_limit_bounds(pipe):
     assert pipe._clamp_limit(None, default=10, ceiling=50, allow_zero=True) == 10
     assert pipe._clamp_limit(0, default=10, ceiling=50, allow_zero=True) == 0
@@ -48,6 +55,14 @@ def test_describe_scope(pipe):
     assert pipe._describe_scope("user-1", []) == "user `user-1`"
     assert pipe._describe_scope(None, ["a", "b"]) == "specific file IDs (2)"
     assert pipe._describe_scope(None, []) == "entire workspace"
+
+
+def test_describe_scope_with_user_query(pipe):
+    assert pipe._describe_scope(None, [], user_query="alice") == 'users matching "alice"'
+    assert (
+        pipe._describe_scope(None, ["chat-1"], user_query="bob", ids_label="chat IDs")
+        == 'users matching "bob", specific chat IDs (1)'
+    )
 
 
 def test_build_db_scan_report_contains_table(pipe):
@@ -130,6 +145,54 @@ def test_build_storage_scan_report(pipe):
     assert "Files on disk without database records" in report
 
 
+def test_build_chat_scan_report(pipe):
+    scan_result = {
+        "examined": 10,
+        "matches": 1,
+        "results": [
+            {
+                "chat_id": "chat-1",
+                "user_id": "user-1",
+                "title": "bad chat",
+                "updated_at": 0,
+                "issue_counts": {"null_bytes": 1},
+                "fields": ["chat"],
+            }
+        ],
+        "counters": {"null_bytes": 1},
+        "has_more": False,
+    }
+    report = pipe._build_chat_scan_report(scan_result, user_labels={"user-1": "Alice"}, scope="entire workspace")
+    assert "Chat scan summary" in report
+    assert "| `chat-1` | Alice |" in report
+
+
+def test_build_chat_repair_report(pipe):
+    repair_result = {
+        "examined": 5,
+        "repaired": 2,
+        "details": [
+            {
+                "chat_id": "chat-1",
+                "user_id": "user-1",
+                "issue_counts": {"lone_low": 1},
+                "fields": ["chat"],
+            }
+        ],
+        "counters": {"lone_low": 1},
+        "has_more": False,
+    }
+    report = pipe._build_chat_repair_report(
+        repair_result,
+        user_labels={"user-1": "Alice"},
+        limit=10,
+        scope="entire workspace",
+    )
+    assert "Chat repair summary" in report
+    assert "Chats repaired: 2" in report
+    assert "| `chat-1` | Alice |" in report
+
+
 def test_build_user_report(pipe):
     users = [
         SimpleNamespace(id="user-1", name="Alice", email="alice@example.com"),
@@ -184,3 +247,20 @@ def test_resolve_user_value_detects_ambiguity(pipe, monkeypatch):
     user_id, error = pipe._resolve_user_value("Boris")
     assert user_id is None
     assert "Multiple users match" in error
+
+
+def test_describe_counts(pipe):
+    counts = {"null_bytes": 2, "lone_high": 1, "strings_touched": 3}
+    summary = pipe._describe_counts(counts)
+    assert "null bytes" in summary
+    assert "lone high" in summary
+
+
+def test_extract_chat_ids_from_text(pipe):
+    text = """
+| User | Chat ID | Title | Issues |
+| --- | --- | --- | --- |
+| Alice | `chat-1` | Bad chat | 1 null byte |
+"""
+    ids = pipe._extract_chat_ids_from_text(text)
+    assert ids == ["chat-1"]

@@ -13,13 +13,16 @@ license: MIT
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
 import shlex
 import threading
 import time
-from dataclasses import dataclass
+from collections import Counter
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
@@ -48,6 +51,7 @@ try:  # pragma: no cover - guard for environments without knowledge module
 except Exception:  # pragma: no cover - fallback when table is absent
     KnowledgeFile = None  # type: ignore
 from open_webui.models.users import Users
+from sqlalchemy import func, or_
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -83,6 +87,397 @@ class UserUsageStats:
     chat_bytes: int = 0
     file_count: int = 0
     file_bytes: int = 0
+
+
+@dataclass
+class ChatSanitizeReport:
+    """Per-chat summary describing what would change after sanitization."""
+
+    changed: bool
+    counts: Counter = field(default_factory=Counter)
+    fields: List[str] = field(default_factory=list)
+    sanitized_values: Dict[str, Any] = field(default_factory=dict)
+
+
+class ChatRepairService:
+    """Encapsulates scanning and repair logic so it can run in a thread."""
+
+    DETAIL_SAMPLE_MAX = 20
+
+    def __init__(self, chunk_size: int = 200):
+        self.chunk_size = max(50, chunk_size)
+
+    def scan(
+        self,
+        *,
+        max_results: int,
+        user_filter: Optional[str] = None,
+        user_query: Optional[str] = None,
+        chat_ids: Optional[Sequence[str]] = None,
+        status_callback: Optional[Callable[[str, int], None]] = None,
+        result_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        user_sorter: Optional[Callable[[str], str]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
+        """Return chats that would change if sanitized."""
+
+        summary_counter: Counter = Counter()
+        matches: List[Dict[str, Any]] = []
+        examined = 0
+        has_more = False
+
+        with get_db() as db:
+            user_batches = self._collect_user_batches(
+                db,
+                user_filter=user_filter,
+                user_query=user_query,
+                chat_ids=chat_ids,
+            )
+            if user_sorter:
+                user_batches.sort(key=lambda batch: user_sorter(batch[0]))
+            else:
+                user_batches.sort(key=lambda batch: (batch[0] or ""))
+
+            for user_id, chat_count in user_batches:
+                if cancel_event and cancel_event.is_set():
+                    has_more = True
+                    break
+                if status_callback:
+                    with contextlib.suppress(Exception):
+                        status_callback(user_id, chat_count)
+
+                query = self._build_query(
+                    db,
+                    user_filter=user_id,
+                    chat_ids=chat_ids,
+                )
+                iterator = query.yield_per(self.chunk_size)
+                for chat in iterator:
+                    if cancel_event and cancel_event.is_set():
+                        has_more = True
+                        break
+                    examined += 1
+                    report = self._analyse_chat(chat, mutate=False)
+                    if not report.changed:
+                        continue
+                    summary_counter.update(report.counts)
+                    row = {
+                        "chat_id": chat.id,
+                        "user_id": chat.user_id,
+                        "title": chat.title or "(untitled)",
+                        "updated_at": chat.updated_at,
+                        "issue_counts": dict(report.counts),
+                        "fields": list(report.fields),
+                    }
+                    matches.append(row)
+                    if result_callback:
+                        with contextlib.suppress(Exception):
+                            result_callback(row)
+                    if max_results and len(matches) >= max_results:
+                        has_more = True
+                        break
+                if has_more:
+                    break
+
+        return {
+            "examined": examined,
+            "matches": len(matches),
+            "results": matches,
+            "counters": dict(summary_counter),
+            "has_more": has_more,
+        }
+
+    def repair(
+        self,
+        *,
+        max_repairs: Optional[int],
+        user_filter: Optional[str] = None,
+        user_query: Optional[str] = None,
+        chat_ids: Optional[Sequence[str]] = None,
+        status_callback: Optional[Callable[[str, int], None]] = None,
+        user_sorter: Optional[Callable[[str], str]] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Dict[str, Any]:
+        """Sanitize chats in-place and commit changes."""
+
+        repaired = 0
+        examined = 0
+        has_more = False
+        summary_counter: Counter = Counter()
+        details: List[Dict[str, Any]] = []
+
+        with get_db() as db:
+            try:
+                user_batches = self._collect_user_batches(
+                    db,
+                    user_filter=user_filter,
+                    user_query=user_query,
+                    chat_ids=chat_ids,
+                )
+                if user_sorter:
+                    user_batches.sort(key=lambda batch: user_sorter(batch[0]))
+                else:
+                    user_batches.sort(key=lambda batch: (batch[0] or ""))
+
+                for user_id, chat_count in user_batches:
+                    if cancel_event and cancel_event.is_set():
+                        has_more = True
+                        break
+                    if status_callback:
+                        with contextlib.suppress(Exception):
+                            status_callback(user_id, chat_count)
+
+                    query = self._build_query(
+                        db,
+                        user_filter=user_id,
+                        chat_ids=chat_ids,
+                    )
+                    iterator = query.yield_per(self.chunk_size)
+                    for chat in iterator:
+                        if cancel_event and cancel_event.is_set():
+                            has_more = True
+                            break
+                        examined += 1
+                        report = self._analyse_chat(chat, mutate=True)
+                        if not report.changed:
+                            continue
+                        summary_counter.update(report.counts)
+                        repaired += 1
+                        if len(details) < self.DETAIL_SAMPLE_MAX:
+                            details.append(
+                                {
+                                    "chat_id": chat.id,
+                                    "user_id": chat.user_id,
+                                    "title": chat.title or "(untitled)",
+                                    "issue_counts": dict(report.counts),
+                                    "fields": list(report.fields),
+                                    "updated_at": chat.updated_at,
+                                }
+                            )
+                        if max_repairs and repaired >= max_repairs:
+                            has_more = True
+                            break
+                    if has_more:
+                        break
+
+                if repaired:
+                    db.commit()
+                else:
+                    db.rollback()
+            except Exception:
+                db.rollback()
+                raise
+
+        return {
+            "examined": examined,
+            "repaired": repaired,
+            "details": details,
+            "counters": dict(summary_counter),
+            "has_more": has_more,
+        }
+
+    def _build_query(
+        self,
+        session,
+        *,
+        user_filter: Optional[str],
+        chat_ids: Optional[Sequence[str]],
+    ):
+        query = session.query(Chat)
+        if user_filter:
+            query = query.filter(Chat.user_id == user_filter)
+        if chat_ids:
+            ids = [cid for cid in chat_ids if cid]
+            if ids:
+                query = query.filter(Chat.id.in_(ids))
+            else:
+                query = query.filter(False)
+        return query.order_by(Chat.updated_at.desc())
+
+    def _collect_user_batches(
+        self,
+        session,
+        *,
+        user_filter: Optional[str],
+        user_query: Optional[str],
+        chat_ids: Optional[Sequence[str]],
+    ) -> List[Tuple[str, int]]:
+        query = session.query(Chat.user_id, func.count(Chat.id))
+        if user_filter:
+            query = query.filter(Chat.user_id == user_filter)
+        if user_query:
+            user_ids = self._lookup_user_ids_by_query(session, user_query)
+            if not user_ids:
+                return []
+            query = query.filter(Chat.user_id.in_(user_ids))
+        if chat_ids:
+            ids = [cid for cid in chat_ids if cid]
+            if ids:
+                query = query.filter(Chat.id.in_(ids))
+            else:
+                return []
+        query = query.group_by(Chat.user_id)
+        return [(row[0], int(row[1])) for row in query]
+
+    def _lookup_user_ids_by_query(self, session, query: str, limit: int = 50) -> List[str]:
+        from open_webui.models.users import User
+
+        text = (query or "").strip()
+        if not text:
+            return []
+        escaped = text.replace("%", "\\%").replace("_", "\\_")
+        like_pattern = f"%{escaped}%"
+        user_rows = (
+            session.query(User.id)
+            .filter(
+                or_(
+                    User.name.ilike(like_pattern),
+                    User.username.ilike(like_pattern),
+                    User.email.ilike(like_pattern),
+                )
+            )
+            .limit(limit)
+            .all()
+        )
+        return [row[0] for row in user_rows]
+
+    def _analyse_chat(self, chat: Chat, *, mutate: bool) -> ChatSanitizeReport:
+        counts: Counter = Counter()
+        fields: List[str] = []
+        sanitized_values: Dict[str, Any] = {}
+
+        title_value, title_changed, title_counts = self._sanitize_value(chat.title)
+        counts.update(title_counts)
+        if title_changed:
+            sanitized_values["title"] = title_value
+            fields.append("title")
+            if mutate:
+                chat.title = title_value
+
+        chat_payload, chat_changed, chat_counts = self._sanitize_value(chat.chat)
+        counts.update(chat_counts)
+        if chat_changed:
+            sanitized_values["chat"] = chat_payload
+            fields.append("chat")
+            if mutate:
+                chat.chat = chat_payload
+
+        meta_payload, meta_changed, meta_counts = self._sanitize_value(chat.meta)
+        counts.update(meta_counts)
+        if meta_changed:
+            sanitized_values["meta"] = meta_payload
+            fields.append("meta")
+            if mutate:
+                chat.meta = meta_payload
+
+        if mutate and sanitized_values:
+            chat.updated_at = max(int(time.time()), chat.updated_at or 0)
+
+        return ChatSanitizeReport(
+            changed=bool(sanitized_values),
+            counts=counts,
+            fields=fields,
+            sanitized_values=sanitized_values,
+        )
+
+    def _sanitize_value(self, value: Any):
+        """Sanitize any JSON-compatible value and report counts."""
+
+        if value is None:
+            return value, False, Counter()
+
+        if isinstance(value, str):
+            sanitized, counts, changed = self._sanitize_string(value)
+            return sanitized if changed else value, changed, counts
+
+        if isinstance(value, list):
+            changed = False
+            counts: Counter = Counter()
+            new_items: List[Any] = []
+            for item in value:
+                sanitized_item, item_changed, item_counts = self._sanitize_value(item)
+                counts.update(item_counts)
+                changed = changed or item_changed
+                new_items.append(sanitized_item)
+            return (new_items if changed else value), changed, counts
+
+        if isinstance(value, tuple):
+            changed = False
+            counts: Counter = Counter()
+            new_items: List[Any] = []
+            for item in value:
+                sanitized_item, item_changed, item_counts = self._sanitize_value(item)
+                counts.update(item_counts)
+                changed = changed or item_changed
+                new_items.append(sanitized_item)
+            sanitized_value = tuple(new_items)
+            return (sanitized_value if changed else value), changed, counts
+
+        if isinstance(value, dict):
+            changed = False
+            counts: Counter = Counter()
+            sanitized_dict: Dict[str, Any] = {}
+            for key, item in value.items():
+                sanitized_item, item_changed, item_counts = self._sanitize_value(item)
+                counts.update(item_counts)
+                if item_changed:
+                    changed = True
+                    sanitized_dict[key] = sanitized_item
+                else:
+                    sanitized_dict[key] = item
+            return (sanitized_dict if changed else value), changed, counts
+
+        return value, False, Counter()
+
+    def _sanitize_string(self, value: str):
+        if not value:
+            return value, Counter(), False
+
+        counts: Counter = Counter()
+        builder: List[str] = []
+        changed = False
+        i = 0
+        length = len(value)
+
+        while i < length:
+            ch = value[i]
+            code = ord(ch)
+
+            if ch == "\x00":
+                counts["null_bytes"] += 1
+                changed = True
+                i += 1
+                continue
+
+            if 0xD800 <= code <= 0xDBFF:
+                if i + 1 < length:
+                    next_code = ord(value[i + 1])
+                    if 0xDC00 <= next_code <= 0xDFFF:
+                        builder.append(ch)
+                        builder.append(value[i + 1])
+                        i += 2
+                        continue
+                counts["lone_high"] += 1
+                builder.append("\ufffd")
+                changed = True
+                i += 1
+                continue
+
+            if 0xDC00 <= code <= 0xDFFF:
+                counts["lone_low"] += 1
+                builder.append("\ufffd")
+                changed = True
+                i += 1
+                continue
+
+            builder.append(ch)
+            i += 1
+
+        sanitized = "".join(builder)
+        if changed:
+            counts["strings_touched"] += 1
+            return sanitized, counts, True
+        return value, counts, False
 
 
 class StorageInventory:
@@ -478,10 +873,41 @@ class Pipe:
             le=2000,
             description="Rows fetched per database batch when scanning.",
         )
+        CHAT_SCAN_DEFAULT_LIMIT: int = Field(
+            default=0,
+            ge=0,
+            le=5000,
+            description="How many problematic chats to list per chat-scan command (0 = no limit).",
+        )
+        CHAT_SCAN_MAX_LIMIT: int = Field(
+            default=200,
+            ge=25,
+            le=1000,
+            description="Hard cap for chat scan output rows.",
+        )
+        CHAT_REPAIR_DEFAULT_LIMIT: int = Field(
+            default=10,
+            ge=0,
+            le=200,
+            description="How many chats to repair per run (0 = no cap).",
+        )
+        CHAT_REPAIR_MAX_LIMIT: int = Field(
+            default=200,
+            ge=10,
+            le=1000,
+            description="Safety ceiling for repairs per command.",
+        )
+        CHAT_DB_CHUNK_SIZE: int = Field(
+            default=200,
+            ge=50,
+            le=1000,
+            description="Rows fetched from the chat table per batch when scanning.",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
         self.service = UploadAuditService(chunk_size=self.valves.DB_CHUNK_SIZE)
+        self.chat_service = ChatRepairService(chunk_size=self.valves.CHAT_DB_CHUNK_SIZE)
         self._apply_logging_valve()
 
     def _apply_logging_valve(self) -> None:
@@ -513,8 +939,10 @@ class Pipe:
             user_filter, user_lookup_error = self._resolve_user_value(raw_user_filter)
         if user_lookup_error:
             return await self._respond(False, user_lookup_error, body)
-        file_ids = options.get("ids") or []
+        id_options = options.get("ids") or []
+        file_ids = id_options
         limit_option = options.get("limit")
+        user_query = options.get("user_query")
 
         try:
             loop = asyncio.get_running_loop()
@@ -635,7 +1063,101 @@ class Pipe:
                     message = f"{message}\n\n{detail_tables}"
                 return await self._respond(True, message, body)
 
-            if command == "db-clean":
+            if command == "chat-scan":
+                target_ids = list(id_options)
+                is_stream = bool(body.get("stream", True))
+                status_cache: Dict[str, str] = {}
+                user_sorter = self._make_user_sorter(status_cache)
+                if is_stream:
+                    return await self._stream_chat_scan(
+                        loop=loop,
+                        emitter=__event_emitter__,
+                        limit_option=limit_option,
+                        user_filter=user_filter,
+                        user_query=user_query,
+                        target_ids=target_ids,
+                        body=body,
+                        status_cache=status_cache,
+                        user_sorter=user_sorter,
+                    )
+                status_callback = self._threadsafe_user_status_callback(
+                    loop, __event_emitter__, status_cache, action="Scanning"
+                )
+                limit = self._clamp_limit(
+                    limit_option,
+                    default=self.valves.CHAT_SCAN_DEFAULT_LIMIT,
+                    ceiling=self.valves.CHAT_SCAN_MAX_LIMIT,
+                    allow_zero=True,
+                )
+                await self._emit_status(
+                    __event_emitter__,
+                    "Scanning chats (no limit)" if limit == 0 else f"Scanning chats (limit={limit})...",
+                )
+                scan_result = await asyncio.to_thread(
+                    self.chat_service.scan,
+                    max_results=limit,
+                    user_filter=user_filter,
+                    user_query=user_query,
+                    chat_ids=target_ids,
+                    status_callback=status_callback,
+                    user_sorter=user_sorter,
+                )
+                await self._emit_status(__event_emitter__, "Scan complete", done=True)
+                user_labels = await self._resolve_user_labels([row["user_id"] for row in scan_result["results"]])
+                scope = self._describe_scope(
+                    user_filter,
+                    target_ids,
+                    user_query=user_query,
+                    ids_label="chat IDs",
+                )
+                message = self._build_chat_scan_report(scan_result, user_labels=user_labels, scope=scope)
+                return await self._respond(True, message, body)
+
+            if command == "chat-repair":
+                if not options.get("confirm"):
+                    reminder = "Add `confirm` to run repairs (example: `chat-repair confirm limit=10`)."
+                    return await self._respond(False, reminder, body)
+                target_ids = list(id_options)
+                if not target_ids:
+                    target_ids = self._extract_chat_ids_from_history(body)
+                repair_status_cache: Dict[str, str] = {}
+                repair_user_sorter = self._make_user_sorter(repair_status_cache)
+                status_callback = self._threadsafe_user_status_callback(
+                    loop, __event_emitter__, repair_status_cache, action="Repairing"
+                )
+                limit = self._clamp_limit(
+                    limit_option,
+                    default=self.valves.CHAT_REPAIR_DEFAULT_LIMIT,
+                    ceiling=self.valves.CHAT_REPAIR_MAX_LIMIT,
+                    allow_zero=True,
+                )
+                await self._emit_status(__event_emitter__, "Repair pass running...")
+                repair_result = await asyncio.to_thread(
+                    self.chat_service.repair,
+                    max_repairs=(None if limit == 0 else limit),
+                    user_filter=user_filter,
+                    user_query=user_query,
+                    chat_ids=target_ids,
+                    status_callback=status_callback,
+                    user_sorter=repair_user_sorter,
+                )
+                await self._emit_status(__event_emitter__, "Repair pass finished", done=True)
+                user_labels = await self._resolve_user_labels([row["user_id"] for row in repair_result["details"]])
+                scope = self._describe_scope(
+                    user_filter,
+                    target_ids,
+                    user_query=user_query,
+                    ids_label="chat IDs",
+                )
+                message = self._build_chat_repair_report(
+                    repair_result,
+                    user_labels=user_labels,
+                    limit=limit,
+                    scope=scope,
+                )
+                return await self._respond(True, message, body)
+
+            if command in {"db-clean", "db-clean-missing-files"}:
                 if not options.get("confirm"):
                     reminder = "Add `confirm` to remove database records whose files are missing."
                     return await self._respond(False, reminder, body)
@@ -659,6 +1181,47 @@ class Pipe:
                 if not entries:
                     scope = self._describe_scope(user_filter, file_ids)
                     return await self._respond(True, f"Every database record still has a matching file ({scope}).", body)
+                clean_result = await asyncio.to_thread(self._clean_db_entries, entries)
+                scope = self._describe_scope(user_filter, file_ids)
+                user_labels = await self._resolve_user_labels(
+                    [
+                        entry.get("user_id")
+                        for entry in clean_result.get("deleted_entries", [])
+                        if entry.get("user_id")
+                    ]
+                )
+                message = self._build_clean_db_report(clean_result, scope, user_labels)
+                return await self._respond(True, message, body)
+
+            if command == "db-clean-orphan-files":
+                if not options.get("confirm"):
+                    reminder = (
+                        "Add `confirm` to remove database rows (and their binaries) for uploads with no references."
+                    )
+                    return await self._respond(False, reminder, body)
+                limit = self._clamp_limit(
+                    limit_option,
+                    default=self.valves.SCAN_DEFAULT_LIMIT,
+                    ceiling=self.valves.SCAN_MAX_LIMIT,
+                    allow_zero=True,
+                )
+                status_callback = self._threadsafe_status_callback(loop, __event_emitter__)
+                await self._emit_status(__event_emitter__, "Reviewing orphaned uploads...")
+                scan_result = await asyncio.to_thread(
+                    self.service.scan_db_orphans,
+                    user_filter=user_filter,
+                    file_ids=file_ids,
+                    limit=(None if limit == 0 else limit),
+                    status_callback=status_callback,
+                )
+                entries = scan_result.get("orphans", [])
+                if not entries:
+                    scope = self._describe_scope(user_filter, file_ids)
+                    return await self._respond(
+                        True,
+                        f"No orphaned uploads remain for {scope}.",
+                        body,
+                    )
                 clean_result = await asyncio.to_thread(self._clean_db_entries, entries)
                 scope = self._describe_scope(user_filter, file_ids)
                 user_labels = await self._resolve_user_labels(
@@ -705,9 +1268,9 @@ class Pipe:
                 return await self._respond(True, message, body)
 
             message = (
-                f"Unknown command `{command}`. Available commands: help, db-scan, storage-scan, user-report, db-clean, storage-clean.\n\n"
-                + self._help_markdown()
-            )
+                "Unknown command `{}`. Available commands: help, db-scan, storage-scan, user-report, "
+                "chat-scan, chat-repair, db-clean-missing-files, db-clean-orphan-files, storage-clean.\n\n"
+            ).format(command) + self._help_markdown()
             return await self._respond(False, message, body)
         except Exception as exc:  # pragma: no cover - defensive guard
             logger.exception("Maintenance pipe failed")
@@ -750,7 +1313,7 @@ class Pipe:
         return _callback
 
     @staticmethod
-    def _log_future_exception(future):  # pragma: no cover - best-effort logging
+    def _log_future_exception(future: Future):  # pragma: no cover - best-effort logging
         try:
             future.result()
         except Exception as exc:
@@ -778,6 +1341,205 @@ class Pipe:
             return
         await emitter({"type": "message", "data": {"content": safe}})
 
+    def _threadsafe_user_status_callback(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        emitter: Optional[Callable[[dict], Awaitable[None]]],
+        cache: Dict[str, str],
+        *,
+        action: str = "Scanning",
+    ) -> Callable[[str, int], None]:
+        seen_users: set[str] = set()
+
+        def _callback(user_id: str, chat_count: int) -> None:
+            user_id = user_id or "unknown"
+            if user_id in seen_users:
+                return
+            seen_users.add(user_id)
+            label = self._lookup_user_label_sync(user_id, cache)
+            message = f"{action} {label}'s chats for corruption (total chats: {chat_count})"
+            logger.info(message)
+            if not emitter:
+                return
+            future = asyncio.run_coroutine_threadsafe(self._emit_status(emitter, message), loop)
+            future.add_done_callback(self._log_future_exception)
+
+        return _callback
+
+    def _threadsafe_result_callback(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: "asyncio.Queue[Optional[Dict[str, Any]]]",
+    ) -> Callable[[Dict[str, Any]], None]:
+        def _callback(row: Dict[str, Any]) -> None:
+            asyncio.run_coroutine_threadsafe(queue.put(row), loop)
+
+        return _callback
+
+    def _make_user_sorter(self, cache: Dict[str, str]) -> Callable[[str], str]:
+        def _sorter(user_id: str) -> str:
+            label = self._lookup_user_label_sync(user_id or "unknown", cache)
+            return (label or user_id or "").lower()
+
+        return _sorter
+
+    async def _stream_chat_scan(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        emitter: Optional[Callable[[dict], Awaitable[None]]],
+        limit_option: Optional[int],
+        user_filter: Optional[str],
+        user_query: Optional[str],
+        target_ids: List[str],
+        body: dict,
+        status_cache: Dict[str, str],
+        user_sorter: Callable[[str], str],
+    ) -> StreamingResponse:
+        limit = self._clamp_limit(
+            limit_option,
+            default=self.valves.CHAT_SCAN_DEFAULT_LIMIT,
+            ceiling=self.valves.CHAT_SCAN_MAX_LIMIT,
+            allow_zero=True,
+        )
+        queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
+        stream_user_cache: Dict[str, str] = {}
+        status_callback = self._threadsafe_user_status_callback(
+            loop, emitter, status_cache, action="Scanning"
+        )
+        result_callback = self._threadsafe_result_callback(loop, queue)
+        scope = self._describe_scope(
+            user_filter,
+            target_ids,
+            user_query=user_query,
+            ids_label="chat IDs",
+        )
+        thread_cancel = threading.Event()
+
+        async def run_scan():
+            await self._emit_status(
+                emitter,
+                "Scanning chats (no limit)" if limit == 0 else f"Scanning chats (limit={limit})...",
+            )
+            result = None
+
+            def _scan_thread():
+                return self.chat_service.scan(
+                    max_results=limit,
+                    user_filter=user_filter,
+                    user_query=user_query,
+                    chat_ids=target_ids,
+                    status_callback=status_callback,
+                    result_callback=result_callback,
+                    user_sorter=user_sorter,
+                    cancel_event=thread_cancel,
+                )
+
+            try:
+                result = await asyncio.to_thread(_scan_thread)
+                return result
+            finally:
+                await queue.put(None)
+                await self._emit_status(emitter, "Scan complete", done=True)
+
+        scan_task = asyncio.create_task(run_scan())
+
+        async def stream():
+            intro = (
+                "Scan in progress - the table below will populate with chats that need fixing.\n\n"
+                "| User | Chat ID | Title | Issues |\n"
+                "| --- | --- | --- | --- |"
+            )
+            yield self._format_data(is_stream=True, model=self.PIPE_NAME, content=intro, finish_reason=None)
+            await self._emit_message_chunk(emitter, intro)
+            cancelled = False
+            try:
+                while True:
+                    row = await queue.get()
+                    if row is None:
+                        break
+                    line = await self._format_chat_stream_row(row, stream_user_cache)
+                    await self._emit_message_chunk(emitter, line)
+                    yield self._format_data(
+                        is_stream=True,
+                        model=self.PIPE_NAME,
+                        content=line,
+                        finish_reason=None,
+                    )
+
+                scan_result = await scan_task
+                summary = self._build_stream_chat_scan_summary(scan_result, scope)
+                await self._emit_message_chunk(emitter, summary)
+                yield self._format_data(
+                    is_stream=True,
+                    model=self.PIPE_NAME,
+                    content=summary,
+                    finish_reason="stop",
+                )
+                yield "data: [DONE]\n\n"
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            finally:
+                thread_cancel.set()
+                if cancelled:
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await scan_task
+
+        return StreamingResponse(stream(), media_type="text/event-stream")
+
+    def _lookup_user_label_sync(self, user_id: str, cache: Dict[str, str]) -> str:
+        if user_id in cache:
+            return cache[user_id]
+        label = user_id
+        if user_id and user_id != "unknown":
+            try:
+                user = Users.get_user_by_id(user_id)
+                if user:
+                    label = (
+                        getattr(user, "name", None)
+                        or getattr(user, "username", None)
+                        or getattr(user, "email", None)
+                        or user_id
+                    )
+            except Exception:
+                logger.debug("Failed to resolve user %s", user_id, exc_info=True)
+        cache[user_id] = label
+        return label
+
+    async def _get_user_label_async(self, user_id: str, cache: Dict[str, str]) -> str:
+        if user_id in cache:
+            return cache[user_id]
+        label = await asyncio.to_thread(self._lookup_user_label_sync, user_id, cache)
+        return label
+
+    async def _format_chat_stream_row(self, row: Dict[str, Any], cache: Dict[str, str]) -> str:
+        user_label = await self._get_user_label_async(row.get("user_id") or "unknown", cache)
+        chat_id = row.get("chat_id") or "unknown"
+        title = self._shorten(self._sanitize_output_text(row.get("title") or "(untitled)"))
+        issues = self._describe_counts(row.get("issue_counts", {}))
+        if not issues:
+            issues = ", ".join(row.get("fields", [])) or "Needs sanitizing"
+        return f"\n| {user_label} | `{chat_id}` | {title} | {issues} |"
+
+    def _build_stream_chat_scan_summary(self, scan_result: Dict[str, Any], scope: str) -> str:
+        lines = ["", "### Scan summary", ""]
+        lines.append(f"- Rows inspected: {scan_result['examined']}")
+        lines.append(f"- Chats needing repair: {scan_result['matches']}")
+        lines.append(f"- Scope: {scope}")
+        counts_summary = self._describe_counts(scan_result.get("counters", {}))
+        if counts_summary:
+            lines.append(f"- Character fixes applied if you run repair: {counts_summary}")
+        if scan_result.get("has_more"):
+            lines.append("- Limit reached. Re-run chat-scan to continue browsing results.")
+        if not scan_result.get("results"):
+            lines.append("- No malformed Unicode detected in this batch.")
+        lines.append("")
+        lines.append(
+            "Run `chat-repair confirm` (use `limit=<n>` or `limit=0` for unlimited) to sanitize the listed chats."
+        )
+        return "\n".join(lines)
+
     def _parse_command(self, text: str):
         try:
             tokens = shlex.split(text.strip())
@@ -786,7 +1548,14 @@ class Pipe:
         if not tokens:
             return "", {}
         command = tokens[0].lower()
-        options: Dict[str, Any] = {"limit": None, "ids": [], "user_id": None, "confirm": False, "path": None}
+        options: Dict[str, Any] = {
+            "limit": None,
+            "ids": [],
+            "user_id": None,
+            "user_query": None,
+            "confirm": False,
+            "path": None,
+        }
         pending_key: Optional[str] = None
         pending_value: List[str] = []
 
@@ -807,8 +1576,21 @@ class Pipe:
                 options["user_id"] = value
             elif key in {"path", "prefix"}:
                 options["path"] = value
+            elif key in {"user_query", "query"}:
+                options["user_query"] = value.strip('"')
 
-        recognized_keys = {"limit", "id", "file", "file_id", "user", "user_id", "path", "prefix"}
+        recognized_keys = {
+            "limit",
+            "id",
+            "file",
+            "file_id",
+            "user",
+            "user_id",
+            "user_query",
+            "query",
+            "path",
+            "prefix",
+        }
 
         def flush_pending() -> None:
             nonlocal pending_key, pending_value
@@ -863,12 +1645,21 @@ class Pipe:
             return default
         return min(value, ceiling)
 
-    def _describe_scope(self, user_filter: Optional[str], file_ids: Sequence[str]) -> str:
+    def _describe_scope(
+        self,
+        user_filter: Optional[str],
+        ids: Sequence[str],
+        *,
+        user_query: Optional[str] = None,
+        ids_label: str = "file IDs",
+    ) -> str:
         scope = []
         if user_filter:
             scope.append(f"user `{user_filter}`")
-        if file_ids:
-            scope.append(f"specific file IDs ({len(file_ids)})")
+        elif user_query:
+            scope.append(f'users matching "{user_query}"')
+        if ids:
+            scope.append(f"specific {ids_label} ({len(ids)})")
         return ", ".join(scope) if scope else "entire workspace"
 
     def _build_db_scan_report(
@@ -886,7 +1677,7 @@ class Pipe:
         lines.append(f"- Files in database: {result['files_total']}")
         lines.append(f"- Referenced in chats: {result['referenced_in_chats']}")
         lines.append(f"- Referenced in knowledge bases: {result['referenced_in_knowledge']}")
-        lines.append(f"- Files with no remaining references: {result['orphan_total']}")
+        lines.append(f"- Orphaned files (no remaining references): {result['orphan_total']}")
         lines.append(f"- Database records with missing files on disk: {missing_total}")
         lines.append(f"- Scope: {scope}")
         if limit == 0:
@@ -901,7 +1692,7 @@ class Pipe:
 
         orphans = result.get("orphans", [])
         if orphans:
-            lines.append("#### Files with no remaining references")
+            lines.append("#### Orphaned files (no remaining references)")
             lines.append("| File ID | Owner | Name | Size | Created (UTC) | Path |")
             lines.append("| --- | --- | --- | --- | --- | --- |")
             for row in orphans:
@@ -970,6 +1761,107 @@ class Pipe:
             lines.append("No files on disk are missing database records.")
 
         return "\n".join(lines)
+
+    def _build_chat_scan_report(
+        self,
+        scan_result: Dict[str, Any],
+        *,
+        user_labels: Dict[str, str],
+        scope: str,
+    ) -> str:
+        lines = ["### Chat scan summary", ""]
+        lines.append(f"- Rows inspected: {scan_result['examined']}")
+        lines.append(f"- Problematic chats listed: {scan_result['matches']}")
+        lines.append(f"- Scope: {scope}")
+        counts_summary = self._describe_counts(scan_result.get("counters", {}))
+        if counts_summary:
+            lines.append(f"- Potential fixes: {counts_summary}")
+        if scan_result.get("has_more"):
+            lines.append("- Limit reached before finishing the data set.")
+        lines.append("")
+        results = scan_result.get("results", [])
+        if not results:
+            lines.append("No malformed Unicode was detected in the scanned chats.")
+            lines.append("Add `limit=50` if you only want to spot-check a subset next time.")
+            return "\n".join(lines)
+
+        lines.append("| Chat ID | User | Title | Updated (UTC) | Issues | Fields |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for row in results:
+            chat_id = row["chat_id"]
+            user_label = user_labels.get(row["user_id"], row["user_id"])
+            title = self._shorten(self._sanitize_output_text(row.get("title") or "(untitled)"))
+            updated = self._format_timestamp(row.get("updated_at"))
+            issues = self._describe_counts(row.get("issue_counts", {}))
+            fields = ", ".join(row.get("fields", [])) or "title"
+            lines.append(f"| `{chat_id}` | {user_label} | {title} | {updated} | {issues} | {fields} |")
+
+        lines.append("")
+        lines.append(
+            "Next step: run `chat-repair confirm limit=10` (or `limit=0` for no cap) to clean the listed chats."
+        )
+        return "\n".join(lines)
+
+    def _build_chat_repair_report(
+        self,
+        repair_result: Dict[str, Any],
+        *,
+        user_labels: Dict[str, str],
+        limit: int,
+        scope: str,
+    ) -> str:
+        lines = ["### Chat repair summary", ""]
+        lines.append(f"- Rows inspected: {repair_result['examined']}")
+        lines.append(f"- Chats repaired: {repair_result['repaired']}")
+        lines.append(f"- Scope: {scope}")
+        counts_summary = self._describe_counts(repair_result.get("counters", {}))
+        if counts_summary:
+            lines.append(f"- Characters replaced/removed: {counts_summary}")
+        if limit == 0:
+            lines.append("- Limit: unlimited (ran until scope finished)")
+        else:
+            lines.append(f"- Limit: {limit}")
+        if repair_result.get("has_more"):
+            lines.append("- Limit reached. Run the command again to continue.")
+        lines.append("")
+        details = repair_result.get("details", [])
+        if not details:
+            lines.append("No chats required changes. You're good to go!")
+            return "\n".join(lines)
+
+        lines.append("| Chat ID | User | Issues | Fields |")
+        lines.append("| --- | --- | --- | --- |")
+        for row in details:
+            chat_id = row["chat_id"]
+            user_label = user_labels.get(row["user_id"], row["user_id"])
+            issues = self._describe_counts(row.get("issue_counts", {}))
+            fields = ", ".join(row.get("fields", [])) or "title"
+            lines.append(f"| `{chat_id}` | {user_label} | {issues} | {fields} |")
+
+        if repair_result.get("has_more"):
+            lines.append("")
+            lines.append("Additional chats still need repairs. Re-run the command to keep going.")
+        return "\n".join(lines)
+
+    def _describe_counts(self, counts: Dict[str, int]) -> str:
+        if not counts:
+            return ""
+        parts = []
+        nulls = counts.get("null_bytes", 0)
+        if nulls:
+            parts.append(f"{nulls} null byte{'s' if nulls != 1 else ''}")
+        high = counts.get("lone_high", 0)
+        if high:
+            parts.append(f"{high} lone high surrogate{'s' if high != 1 else ''}")
+        low = counts.get("lone_low", 0)
+        if low:
+            parts.append(f"{low} lone low surrogate{'s' if low != 1 else ''}")
+        touched = counts.get("strings_touched", 0)
+        if touched and not parts:
+            parts.append(f"{touched} string{'s' if touched != 1 else ''} sanitized")
+        elif touched:
+            parts.append(f"{touched} string{'s' if touched != 1 else ''}")
+        return ", ".join(parts)
 
     def _load_user_records(self, user_filter: Optional[str]) -> List[Any]:
         if user_filter:
@@ -1598,6 +2490,43 @@ class Pipe:
                 return str(content["content"])
         return ""
 
+    def _extract_chat_ids_from_history(self, body: dict) -> List[str]:
+        ids: List[str] = []
+        messages = body.get("messages") or []
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            content = self._collapse_content(message.get("content"))
+            if not content:
+                continue
+            ids.extend(self._extract_chat_ids_from_text(content))
+            if ids:
+                break
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for cid in ids:
+            if cid not in seen:
+                seen.add(cid)
+                deduped.append(cid)
+        return deduped
+
+    def _extract_chat_ids_from_text(self, text: str) -> List[str]:
+        ids: List[str] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.split("|") if cell.strip()]
+            if len(cells) < 2:
+                continue
+            for cell in cells:
+                if cell.startswith("`") and cell.endswith("`"):
+                    chat_id = cell.strip("`").strip()
+                    if chat_id:
+                        ids.append(chat_id)
+                        break
+        return ids
+
     def _help_markdown(self) -> str:
         return """# Open WebUI Maintenance Pipe
 
@@ -1611,10 +2540,14 @@ These commands operate only on the `file` table and its metadata.
   - **How it works:** Reads the `file` table in batches, extracts file IDs from `history.messages.*.files[]` and the knowledge tables, and optionally scopes the work via `user=`/`id=` filters. Matching storage lookups confirm whether each database row still has a binary on disk. Set `limit=0` to return everything; otherwise the limit caps both orphan listings and missing-file rows.
   - **When to run:** After content migrations, following bulk deletions, or on a regular cadence (weekly/monthly) to prevent unreferenced data from accumulating.
 
-- `db-clean confirm [limit=<n>] [...]`
+- `db-clean-missing-files confirm [limit=<n>] [...]` *(alias: `db-clean`)*
   - **Purpose:** Remove the database rows that `db-scan` proved were already missing their binaries.
   - **Safety:** Requires the literal word `confirm`, respects `limit`, deletes in small batches by default, and prints a table of every row removed (owner, filename, path, last update) for compliance records.
   - **Best practice:** Start with conservative limits (for example `limit=10`) in production and widen only after verifying results.
+- `db-clean-orphan-files confirm [limit=<n>] [...]`
+  - **Purpose:** Delete uploads that still exist on disk but have zero references in chats or knowledge bases (the “Orphaned files (no remaining references)” group from `db-scan`).
+  - **Safety:** Removes both the database row and the binary via `Files.delete_file_by_id`, honors `limit`, and produces the same audit table as other clean commands.
+  - **Best practice:** Run `db-scan` first to confirm scope, then clean in manageable batches while capturing the Markdown table for change-control notes.
 
 ## Storage maintenance
 These commands walk the upload directory and never touch database rows directly.
@@ -1629,6 +2562,19 @@ These commands walk the upload directory and never touch database rows directly.
   - **Safety:** Requires `confirm`, honors `limit`, and outputs a table of every deleted file (derived ID, name, size, path, last modified) so that enterprise admins can document the remediation.
   - **Best practice:** Combine with `storage-scan` output and process in small increments, especially on shared storage.
 
+## Chat maintenance
+These commands audit stored chats for malformed Unicode (null bytes, orphaned surrogate halves) and can optionally repair them in-place.
+
+- `chat-scan [limit=<n>] [user=<id>|user=me] [user_query="name"] [id=<chat-id>]`
+  - **Purpose:** Stream a live table of chats whose titles, payloads, or metadata would change if sanitized using the backend logic.
+  - **How it works:** Batches chats by owner, inspects each JSON payload, and emits rows (plus running totals) via the event emitter so you can watch progress.
+  - **When to run:** Before PostgreSQL index rebuilds, after imports from untrusted systems, or whenever assistants start throwing “invalid byte sequence” errors.
+
+- `chat-repair confirm [limit=<n>] [user=<id>|user=me] [user_query="name"] [id=<chat-id>]`
+  - **Purpose:** Apply the same sanitization logic as `chat-scan` but persist the cleaned values back to the `chat` table.
+  - **Safety:** Requires `confirm`, honors `limit` (default 10, `limit=0` for unlimited), and shows a sample of the chats it fixed so you can audit changes.
+  - **Best practice:** Run `chat-scan` first, then feed the resulting chat IDs (or rely on automatic history scraping) into `chat-repair confirm limit=10`.
+
 ## User usage reporting
 These commands summarize end-user footprints so you can plan capacity or chargeback.
 
@@ -1638,7 +2584,7 @@ These commands summarize end-user footprints so you can plan capacity or chargeb
   - **When to run:** Before large cleanup projects, when preparing usage reports for stakeholders, or to identify the accounts consuming the most storage.
 
 ## General guidance
-1. Commands never delete anything unless you intentionally run `db-clean` or `storage-clean` with `confirm`.
+1. Commands never delete anything unless you intentionally run `db-clean-missing-files`, `db-clean-orphan-files`, or `storage-clean` with `confirm`.
 2. Ownership labels use `file.user_id` and are resolved to user-friendly names where possible.
 3. Paths shown in storage scans reference `UPLOAD_DIR` by default; future releases will add additional inventory backends for S3 or other providers.
 4. Combine `limit`, `user`, and `id` options to align maintenance actions with enterprise change-control procedures.

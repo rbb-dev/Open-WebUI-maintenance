@@ -1,8 +1,8 @@
 # Open WebUI Maintenance Pipe
 
-Open WebUI Maintenance is a chat-first function/pipe for [Open WebUI](https://github.com/open-webui/open-webui) administrators. It scans uploaded files, cross-checks chats and knowledge bases, audits on-disk storage, and produces usage summaries so you can keep deployments tidy without leaving the UI. The result is a concise Markdown report (plus optional cleanup helpers) you can drop straight into tickets or runbooks.
+Open WebUI Maintenance is a chat-first function/pipe for [Open WebUI](https://github.com/open-webui/open-webui) administrators. It scans uploaded files, cross-checks chats and knowledge bases, audits on-disk storage, repairs malformed chats, and produces usage summaries so you can keep deployments tidy without leaving the UI. The result is a concise Markdown report (plus optional cleanup helpers) you can drop straight into tickets or runbooks.
 
-Unlike destructive clean-up scripts, this pipe never deletes anything—it simply answers the question “which files are safe to purge?” and leaves the remediation step in your hands.
+Unlike destructive clean-up scripts, every mutation requires the literal `confirm` keyword (`db-clean-missing-files`, `db-clean-orphan-files`, `storage-clean`, `chat-repair`). You stay in control of scope, limits, and sequencing.
 
 ---
 
@@ -23,8 +23,9 @@ Unlike destructive clean-up scripts, this pipe never deletes anything—it simpl
 
 ## Features
 - **Workspace-wide scan:** Loads the entire `file` table (optionally scoped by user or file IDs) and checks each upload against chats and knowledge bases.
+- **Chat sanitization:** `chat-scan` pinpoints malformed Unicode inside chats, and `chat-repair` fixes them with the same logic the backend uses.
 - **Filesystem audit:** `storage-scan` walks the upload directory and lists files on disk that have no matching database entry.
-- **Guided cleanup commands:** `db-clean` and `storage-clean` delete only the rows/files you scoped, and they require `confirm` for safety.
+- **Guided cleanup commands:** `db-clean-missing-files`, `db-clean-orphan-files`, and `storage-clean` only act on the scope you specify, and they require `confirm` for safety.
 - **CLI-style workflow:** Interact with the pipe directly from a chat window; each command streams Markdown that you can copy into tickets or runbooks.
 - **Configurable limits:** Valves let you change default/maximum row counts and batch sizes without editing code.
 
@@ -46,11 +47,16 @@ Interact with the pipe as if it were a CLI exposed through chat.
 
 ### Database maintenance
 - `db-scan [options]` — load the file table, compare it against chats/knowledge bases, and list uploads that no longer have references. Also surfaces database records whose files are missing on disk.
-- `db-clean confirm [options]` — delete the database records whose files were flagged as missing. Requires the literal word `confirm`.
+- `db-clean-missing-files confirm [options]` *(alias: `db-clean`)* — delete the database records whose files were flagged as missing. Requires the literal word `confirm`.
+- `db-clean-orphan-files confirm [options]` — delete the uploads that no longer have references anywhere (both the database row and the binary are removed). Also requires `confirm`.
 
 ### Storage maintenance
 - `storage-scan [options]` — walk the upload directory and list files sitting on disk without database records.
 - `storage-clean confirm [options]` — delete the files on disk that lack database records. Also requires `confirm`.
+
+### Chat maintenance
+- `chat-scan [options]` — stream a live table of chats that contain null bytes or stray UTF-16 surrogate halves. Supports `user_query="name"` or `id=<chat-id>` filters, and respects `limit` (default unlimited).
+- `chat-repair confirm [options]` — sanitize the chats flagged by `chat-scan` (or a scope you specify) using the same backend logic. Requires `confirm`, honors `limit` (default 10, `limit=0` for unlimited), and prints a table of the cleaned chats.
 
 ### User reporting
 - `user-report [options]` — aggregate per-user chat counts/sizes and file counts/sizes, then show the combined storage footprint. Helpful for chargeback, quota reviews, or targeting cleanup work.
@@ -58,17 +64,21 @@ Interact with the pipe as if it were a CLI exposed through chat.
 ### Options
 | Option | Description |
 | --- | --- |
-| `limit=<n>` | Cap the number of orphaned files in the output. `limit=0` lifts the cap (default `25`, max `500`). |
-| `user=<uuid>` / `user=me` | Restrict the scan to files uploaded by a specific user (current user when `me`). |
-| `id=<file-id>` | One or more comma/semicolon-separated file IDs to inspect directly. |
-| `confirm` | Required for `db-clean` and `storage-clean`. Prevents accidental deletions. |
+| `limit=<n>` | Cap the number of rows in the output or repair pass. `limit=0` lifts the cap (ceiling depends on the command). |
+| `user=<uuid>` / `user=me` | Restrict the scan/repair to a specific user (current user when `me`). |
+| `user_query="text"` | Fuzzy-search users by name/username/email when you don't have the UUID handy (chat commands only). |
+| `id=<file-or-chat-id>` | One or more comma/semicolon-separated IDs. Applies to file IDs for db/storage commands and chat IDs for chat maintenance. |
+| `confirm` | Required for `db-clean-missing-files`, `db-clean-orphan-files`, `storage-clean`, and `chat-repair`. Prevents accidental mutations. |
 
 ### Examples
 ```
 db-scan                      # Database vs. chat/knowledge scan (default limit=25 entries)
+db-clean-missing-files confirm limit=10    # Delete up to 10 database records whose files are missing
 storage-scan                 # Filesystem audit (default limit=25 entries per table)
-db-clean confirm limit=10    # Delete up to 10 database records whose files are missing
 storage-clean confirm        # Delete every file on disk that lacks a database record (respecting the limit)
+chat-scan user_query="alice" # Stream chats owned by users with “alice” in their profile
+chat-repair confirm limit=5  # Repair the next five malformed chats in scope
+db-clean-orphan-files confirm limit=10  # Remove 10 unreferenced uploads and their binaries
 user-report limit=20         # List the top 20 users by combined chat+file size
 ```
 
@@ -81,7 +91,7 @@ Each `db-scan` command returns a Markdown block similar to:
 - Files in database: 312
 - Referenced in chats: 287
 - Referenced in knowledge bases: 10
-- Files with no remaining references: 15
+- Orphaned files (no remaining references): 15
 - Database records with missing files on disk: 2
 - Scope: entire workspace
 - Output limit: 25
@@ -101,7 +111,10 @@ See [`docs/VALVES.md`](docs/VALVES.md) for the full valve matrix. Highlights:
 | `ENABLE_LOGGING` | `False` | Emit INFO logs for each scan stage when you need audit trails. |
 | `SCAN_DEFAULT_LIMIT` / `SCAN_MAX_LIMIT` | `25` / `500` | Defaults/caps for the orphaned-file scan. |
 | `STORAGE_SCAN_DEFAULT_LIMIT` / `STORAGE_SCAN_MAX_LIMIT` | `25` / `500` | Defaults/caps for storage-scan output and cleanup batch sizes. |
-| `DB_CHUNK_SIZE` | `400` | Number of rows fetched per SQLAlchemy batch. Increase for high-latency databases. |
+| `CHAT_SCAN_DEFAULT_LIMIT` / `CHAT_SCAN_MAX_LIMIT` | `0` / `200` | Defaults/caps for chat-scan rows (0 = unlimited). |
+| `CHAT_REPAIR_DEFAULT_LIMIT` / `CHAT_REPAIR_MAX_LIMIT` | `10` / `200` | Defaults/caps for chat-repair batches. |
+| `DB_CHUNK_SIZE` | `400` | Number of rows fetched per SQLAlchemy batch for file/storage scans. |
+| `CHAT_DB_CHUNK_SIZE` | `200` | Chat rows fetched per batch during chat-scan/repair. |
 
 ## Testing
 The repository includes a lightweight pytest suite that exercises helper utilities without requiring a live Open WebUI instance.
@@ -121,6 +134,7 @@ open-webui-maintenance/
 │   └── VALVES.md                # Extended valve guidance
 └── tests/
     ├── conftest.py             # Open WebUI stubs for pytest
+    ├── test_chat_repair_service.py
     ├── test_file_cleanup_service.py
     └── test_pipe_utilities.py
 ```
