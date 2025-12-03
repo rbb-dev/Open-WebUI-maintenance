@@ -5,7 +5,7 @@ import pytest
 from types import SimpleNamespace
 
 import open_webui_maintenance as cleanup
-from open_webui_maintenance import Pipe, UserUsageStats
+from open_webui_maintenance import LocalStorageInventory, Pipe, UserUsageStats
 
 
 @pytest.fixture(scope="module")
@@ -306,3 +306,16 @@ def test_extract_chat_ids_from_text(pipe):
 """
     ids = pipe._extract_chat_ids_from_text(text)
     assert ids == ["chat-1"]
+
+
+def test_derive_file_id_supports_underscored_and_inline_names():
+    uuid_value = "123e4567-e89b-12d3-a456-426614174abc"
+    assert (
+        LocalStorageInventory._derive_file_id(f"{uuid_value}_sample.txt")
+        == uuid_value
+    )
+    assert (
+        LocalStorageInventory._derive_file_id(f"inline-image-{uuid_value}.png")
+        == uuid_value
+    )
+    assert LocalStorageInventory._derive_file_id("notes.txt") is None

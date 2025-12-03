@@ -982,10 +982,29 @@ class LocalStorageInventory(StorageInventory):
 
     @staticmethod
     def _derive_file_id(filename: str) -> Optional[str]:
+        """Return the first UUID embedded in the filename, if present."""
+
+        if not filename:
+            return None
+        # Fast path: still support the original "<uuid>_something" layout.
         prefix, _, _ = filename.partition("_")
         try:
             UUID(prefix)
             return prefix
+        except Exception:
+            pass
+
+        # Fallback: scan for any UUID substring (handles inline-image-<uuid>.png naming).
+        match = re.search(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+            filename,
+        )
+        if not match:
+            return None
+        candidate = match.group(0)
+        try:
+            UUID(candidate)
+            return candidate
         except Exception:
             return None
 
