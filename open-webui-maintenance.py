@@ -407,7 +407,7 @@ class InlineImageService:
                 "skipped_reasons": skipped_counter,
             }
 
-        chat.chat = json.loads(json.dumps(new_payload))
+        chat.chat = new_payload
         chat.updated_at = max(int(time.time()), chat.updated_at or 0)
         flag_modified(chat, "chat")
         session.flush()
@@ -648,34 +648,39 @@ class InlineImageService:
         handler: Callable[[str], Tuple[str, List[Any]]],
         _depth: int = 0,
     ) -> Tuple[Any, List[Any]]:
-        """Apply `handler` to every string in a nested structure, returning matches."""
+        """Apply `handler` to every string in a nested structure, returning matches.
+
+        Returns a NEW structure with transformed strings. Does not mutate the input.
+        """
         if _depth > self.MAX_STRING_MAP_DEPTH:
             raise ValueError("Nested payload exceeded safe recursion depth")
         if isinstance(node, str):
             new_value, matches = handler(node)
             return new_value, matches
         if isinstance(node, list):
-            aggregated: List[Any] = []
-            for idx, item in enumerate(node):
+            new_list = []
+            results = []
+            for item in node:
                 new_value, found = self._map_strings(item, handler, _depth + 1)
-                node[idx] = new_value
-                aggregated.extend(found)
-            return node, aggregated
+                new_list.append(new_value)
+                results.extend(found)
+            return new_list, results
         if isinstance(node, tuple):
             updated = []
-            aggregated: List[Any] = []
+            results = []
             for item in node:
                 new_value, found = self._map_strings(item, handler, _depth + 1)
                 updated.append(new_value)
-                aggregated.extend(found)
-            return tuple(updated), aggregated
+                results.extend(found)
+            return tuple(updated), results
         if isinstance(node, dict):
-            aggregated: List[Any] = []
+            new_dict = {}
+            results = []
             for key, value in node.items():
                 new_value, found = self._map_strings(value, handler, _depth + 1)
-                node[key] = new_value
-                aggregated.extend(found)
-            return node, aggregated
+                new_dict[key] = new_value
+                results.extend(found)
+            return new_dict, results
         return node, []
 
     def _ensure_payload(self, payload: Any) -> Any:
