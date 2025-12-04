@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import math
+import mimetypes
 import re
 import shlex
 import threading
@@ -80,6 +81,8 @@ class FileSummary:
 
 @dataclass
 class DiskObject:
+    """File discovered on disk during a storage inventory walk."""
+
     file_id: Optional[str]
     path: str
     name: str
@@ -89,6 +92,8 @@ class DiskObject:
 
 @dataclass
 class UserUsageStats:
+    """Aggregated chat/file counts and byte totals for a single user."""
+
     chat_count: int = 0
     chat_bytes: int = 0
     file_count: int = 0
@@ -107,6 +112,8 @@ class ChatSanitizeReport:
 
 @dataclass
 class InlineImageMatch:
+    """Single inline-image match pulled from chat content."""
+
     alt_text: str
     mime_type: str
     base64_data: str
@@ -115,6 +122,8 @@ class InlineImageMatch:
 
 @dataclass
 class InlineImageUserSummary:
+    """Per-user byte summary returned by image scans."""
+
     user_id: Optional[str]
     chats_with_inline: int
     inline_images: int
@@ -123,6 +132,8 @@ class InlineImageUserSummary:
 
 @dataclass
 class InlineImageDetachRecord:
+    """Audit entry describing the images detached from one chat."""
+
     chat_id: str
     user_id: Optional[str]
     images_detached: int
@@ -131,6 +142,7 @@ class InlineImageDetachRecord:
 
 
 class InlineImageService:
+    """Find and normalize inline base64 images embedded inside chat payloads."""
     MARKDOWN_DATA_URI_PATTERN = re.compile(
         r"!\[(?P<alt>[^\]]*)\]\(data:(?P<mime>[^;]+);base64,(?P<data>[^)]+)\)", re.IGNORECASE
     )
@@ -145,8 +157,10 @@ class InlineImageService:
         "image/webp": "webp",
         "image/gif": "gif",
     }
+    MAX_STRING_MAP_DEPTH = 1000
 
     def __init__(self, chunk_size: int = 200):
+        """Initialize the service with safe database batch sizes."""
         self.chunk_size = max(50, chunk_size)
 
     def scan(
@@ -161,6 +175,7 @@ class InlineImageService:
         user_sorter: Optional[Callable[[str], str]],
         cancel_event: Optional[threading.Event],
     ) -> Dict[str, Any]:
+        """Aggregate inline-image usage per user and optionally stream rows."""
         summaries: List[InlineImageUserSummary] = []
         total_users = 0
         total_images = 0
@@ -229,6 +244,7 @@ class InlineImageService:
         user_sorter: Optional[Callable[[str], str]],
         cancel_event: Optional[threading.Event],
     ) -> Dict[str, Any]:
+        """Persist inline blobs as managed files and rewrite chats in place."""
         processed = 0
         total_images = 0
         total_bytes = 0
@@ -290,6 +306,7 @@ class InlineImageService:
         }
 
     def _scan_user_chats(self, query, cancel_event: Optional[threading.Event]) -> Dict[str, int]:
+        """Walk chats for a single user and return aggregate inline-image counts."""
         chats_with_inline = 0
         inline_images = 0
         inline_bytes = 0
@@ -309,12 +326,16 @@ class InlineImageService:
         }
 
     def _detach_from_chat(self, session, chat: Chat) -> Dict[str, Any]:
+        """Handle inline image replacement for a single chat row."""
         payload = self._ensure_payload(chat.chat)
 
         def handler(text: str):
             return self._replace_inline_images(text, chat.user_id)
 
-        new_payload, matches_info = self._map_strings(payload, handler)
+        try:
+            new_payload, matches_info = self._map_strings(payload, handler)
+        except ValueError:
+            return {"images_detached": 0, "bytes_detached": 0, "file_ids": []}
         if not matches_info:
             return {"images_detached": 0, "bytes_detached": 0, "file_ids": []}
 
@@ -336,6 +357,7 @@ class InlineImageService:
         text: str,
         user_id: Optional[str],
     ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Replace inline Markdown blobs in a string and return the replacements."""
         trimmed = text.strip()
         bare_data = self._parse_data_uri(trimmed)
         if bare_data:
@@ -375,11 +397,18 @@ class InlineImageService:
         return "".join(rebuilt), entries
 
     def _persist_inline_image(self, user_id: Optional[str], mime_type: str, base64_data: str) -> Optional[str]:
+        """Decode, validate, and store a single base64 payload via Storage."""
         mime = mime_type.lower() if mime_type else "image/png"
-        extension = self.SUPPORTED_MIME_EXTENSIONS.get(mime, "bin")
+        extension = self.SUPPORTED_MIME_EXTENSIONS.get(mime)
+        if not extension and mime.startswith("image/"):
+            guessed = mimetypes.guess_extension(mime)
+            if guessed:
+                extension = guessed.lstrip(".")
+        if not extension:
+            return None
         try:
             cleaned = re.sub(r"\s+", "", base64_data or "")
-            binary = base64.b64decode(cleaned, validate=False)
+            binary = base64.b64decode(cleaned, validate=True)
         except Exception:
             return None
         if not binary:
@@ -421,6 +450,7 @@ class InlineImageService:
         user_query: Optional[str],
         chat_ids: Optional[Sequence[str]],
     ) -> List[Tuple[str, int]]:
+        """Return (user_id, chat_count) pairs honoring current filters."""
         query = session.query(Chat.user_id, func.count(Chat.id))
         if user_filter:
             query = query.filter(Chat.user_id == user_filter)
@@ -439,6 +469,7 @@ class InlineImageService:
         return [(row[0], int(row[1])) for row in query]
 
     def _lookup_user_ids_by_query(self, session, query: str, limit: int = 50) -> List[str]:
+        """Fuzzy match users and return a bounded list of IDs."""
         from open_webui.models.users import User
 
         text = (query or "").strip()
@@ -467,6 +498,7 @@ class InlineImageService:
         user_filter: Optional[str],
         chat_ids: Optional[Sequence[str]],
     ):
+        """Create a chat query scoped to one user or explicit chat IDs."""
         query = session.query(Chat)
         if user_filter:
             query = query.filter(Chat.user_id == user_filter)
@@ -479,6 +511,7 @@ class InlineImageService:
         return query.order_by(Chat.updated_at.desc())
 
     def _extract_inline_images(self, payload: Any) -> List[InlineImageMatch]:
+        """Traverse a payload and collect every inline-image reference."""
         data = self._ensure_payload(payload)
         def handler(text: str):
             found = []
@@ -507,17 +540,28 @@ class InlineImageService:
                 )
             return text, found
 
-        _, found_matches = self._map_strings(data, handler)
+        try:
+            _, found_matches = self._map_strings(data, handler)
+        except ValueError:
+            return []
         return [match for match in found_matches if isinstance(match, InlineImageMatch)]
 
-    def _map_strings(self, node: Any, handler: Callable[[str], Tuple[str, List[Any]]]) -> Tuple[Any, List[Any]]:
+    def _map_strings(
+        self,
+        node: Any,
+        handler: Callable[[str], Tuple[str, List[Any]]],
+        _depth: int = 0,
+    ) -> Tuple[Any, List[Any]]:
+        """Apply `handler` to every string in a nested structure, returning matches."""
+        if _depth > self.MAX_STRING_MAP_DEPTH:
+            raise ValueError("Nested payload exceeded safe recursion depth")
         if isinstance(node, str):
             new_value, matches = handler(node)
             return new_value, matches
         if isinstance(node, list):
             aggregated: List[Any] = []
             for idx, item in enumerate(node):
-                new_value, found = self._map_strings(item, handler)
+                new_value, found = self._map_strings(item, handler, _depth + 1)
                 node[idx] = new_value
                 aggregated.extend(found)
             return node, aggregated
@@ -525,20 +569,21 @@ class InlineImageService:
             updated = []
             aggregated: List[Any] = []
             for item in node:
-                new_value, found = self._map_strings(item, handler)
+                new_value, found = self._map_strings(item, handler, _depth + 1)
                 updated.append(new_value)
                 aggregated.extend(found)
             return tuple(updated), aggregated
         if isinstance(node, dict):
             aggregated: List[Any] = []
             for key, value in node.items():
-                new_value, found = self._map_strings(value, handler)
+                new_value, found = self._map_strings(value, handler, _depth + 1)
                 node[key] = new_value
                 aggregated.extend(found)
             return node, aggregated
         return node, []
 
     def _ensure_payload(self, payload: Any) -> Any:
+        """Coerce serialized chat payloads into JSON-compatible Python objects."""
         if isinstance(payload, (dict, list, tuple)):
             return payload
         if isinstance(payload, str):
@@ -553,6 +598,7 @@ class InlineImageService:
 
     @staticmethod
     def _estimate_base64_size(data: str) -> int:
+        """Return a quick byte estimate for base64 data so reports stay lightweight."""
         if not data:
             return 0
         cleaned = re.sub(r"\s+", "", data)
@@ -563,6 +609,7 @@ class InlineImageService:
         return max(0, (length * 3) // 4 - padding)
 
     def _parse_data_uri(self, text: str) -> Optional[Dict[str, str]]:
+        """Extract MIME/data components from a bare `data:` URI string."""
         match = self.BARE_DATA_URI_PATTERN.match(text or "")
         if not match:
             return None
@@ -955,17 +1002,23 @@ class StorageInventory:
     """Abstract source of disk objects (local FS, S3, etc.)."""
 
     def iter_objects(self) -> Iterator[DiskObject]:  # pragma: no cover - interface
+        """Yield `DiskObject` entries for every file managed by this inventory."""
         raise NotImplementedError
 
     def delete(self, disk_object: DiskObject) -> None:  # pragma: no cover - interface
+        """Remove a `DiskObject` from the backing store."""
         raise NotImplementedError
 
 
 class LocalStorageInventory(StorageInventory):
+    """Inventory implementation backed by the Open WebUI upload directory."""
+
     def __init__(self, root: Optional[str] = None):
+        """Initialize the inventory with an optional override path."""
         self.root = Path(root or UPLOAD_DIR).expanduser()
 
     def iter_objects(self) -> Iterator[DiskObject]:
+        """Yield every file below `UPLOAD_DIR`, tagging derived UUIDs when found."""
         if not self.root.exists():
             return iter(())
         for entry in self.root.rglob("*"):
@@ -1009,6 +1062,7 @@ class LocalStorageInventory(StorageInventory):
             return None
 
     def delete(self, disk_object: DiskObject) -> None:
+        """Remove the referenced file from disk."""
         try:
             path = Path(disk_object.path)
             if path.exists():
@@ -1018,7 +1072,10 @@ class LocalStorageInventory(StorageInventory):
 
 
 class StorageAuditService:
+    """Compare the database view of uploads with what actually sits on disk."""
+
     def __init__(self, inventory: StorageInventory):
+        """Inject a storage inventory implementation (local disk, S3, etc.)."""
         self.inventory = inventory
 
     def scan_db_orphans(
@@ -1028,6 +1085,7 @@ class StorageAuditService:
         limit: Optional[int],
         status_callback: Optional[Callable[[str, str], None]] = None,
     ) -> Dict[str, Any]:
+        """Return upload rows that no longer have binaries on disk, and vice versa."""
         disk_index: Set[str] = set()
         missing: List[Dict[str, Any]] = []
         extras: List[Dict[str, Any]] = []
@@ -1089,6 +1147,7 @@ class UploadAuditService:
     """Performs cross-table scans to enumerate orphaned uploads."""
 
     def __init__(self, chunk_size: int = 400):
+        """Store chunk size used across every SQLAlchemy iterator."""
         self.chunk_size = max(50, chunk_size)
 
     def scan_db_orphans(
@@ -1156,6 +1215,7 @@ class UploadAuditService:
         limit: Optional[int],
         status_callback: Optional[Callable[[str, str], None]] = None,
     ) -> Dict[str, Any]:
+        """Compare database rows against a storage inventory and report gaps."""
         with get_db() as db:
             files = self._load_files(
                 db,
@@ -1169,6 +1229,7 @@ class UploadAuditService:
         return auditor.scan_db_orphans(files, limit=limit, status_callback=status_callback)
 
     def _empty_summary(self, files: Dict[str, FileSummary]) -> Dict[str, Any]:
+        """Return an empty result payload when work is cancelled early."""
         return {
             "files_total": len(files),
             "referenced_in_chats": 0,
@@ -1186,6 +1247,7 @@ class UploadAuditService:
         file_ids: Optional[Sequence[str]],
         cancel_event: Optional[threading.Event],
     ) -> Dict[str, FileSummary]:
+        """Materialize a dictionary of FileSummary objects honoring filters."""
         query = session.query(File)
         if user_filter:
             query = query.filter(File.user_id == user_filter)
@@ -1220,6 +1282,7 @@ class UploadAuditService:
         *,
         cancel_event: Optional[threading.Event],
     ) -> Set[str]:
+        """Stream chats to collect every file ID referenced inside payloads."""
         referenced: Set[str] = set()
         processed = 0
         query = session.query(Chat.chat).yield_per(self.chunk_size)
@@ -1239,6 +1302,7 @@ class UploadAuditService:
         session,
         emit: Callable[[str, str], None],
     ) -> Set[str]:
+        """Collect file IDs referenced by the optional knowledge base."""
         if KnowledgeFile is None:  # pragma: no cover - depends on deployment
             emit("knowledge", "Knowledge table unavailable; skipping")
             return set()
@@ -1254,6 +1318,7 @@ class UploadAuditService:
         return referenced
 
     def _extract_size(self, meta: Optional[dict]) -> Optional[int]:
+        """Pull a best-effort file size from the serialized `meta` blob."""
         data = meta or {}
         size = data.get("size") if isinstance(data, dict) else None
         if size is None and isinstance(data, dict):
@@ -1266,6 +1331,7 @@ class UploadAuditService:
             return None
 
     def _normalize_meta(self, meta: Optional[Any]) -> Dict[str, Any]:
+        """Return a dict representation of `meta`, handling JSON strings gracefully."""
         if isinstance(meta, dict):
             return meta
         if isinstance(meta, str):
@@ -1276,6 +1342,7 @@ class UploadAuditService:
         return {}
 
     def _extract_file_ids_from_chat(self, payload: dict) -> Set[str]:
+        """Collect file IDs from chat history payloads."""
         history = payload.get("history", {}) if isinstance(payload, dict) else {}
         messages = history.get("messages", {}) if isinstance(history, dict) else {}
         file_ids: Set[str] = set()
@@ -1294,6 +1361,7 @@ class UploadAuditService:
         return file_ids
 
     def _coerce_file_id(self, entry: Any) -> str:
+        """Normalize potential file references to a plain ID string."""
         if isinstance(entry, str):
             return entry.strip()
         if not isinstance(entry, dict):
@@ -1311,6 +1379,7 @@ class UploadAuditService:
         return ""
 
     def _summarize_file(self, record: FileSummary) -> Dict[str, Any]:
+        """Format a file summary for Markdown/JSON responses."""
         content_type = record.meta.get("content_type") if isinstance(record.meta, dict) else None
         return {
             "file_id": record.id,
@@ -1325,6 +1394,7 @@ class UploadAuditService:
 
 
 class Pipe:
+    """Chat-facing command dispatcher that orchestrates every maintenance workflow."""
     PIPE_ID = "maintenance"
     PIPE_NAME = "Open WebUI: Maintenance"
     MAX_TOKEN_LENGTH = 256  # Cap individual CLI tokens to avoid runaway payloads.
@@ -1361,7 +1431,7 @@ class Pipe:
             description="Emit INFO logs for the maintenance pipe (disabled by default).",
         )
         SCAN_DEFAULT_LIMIT: int = Field(
-            default=25,
+            default=5,
             ge=0,
             le=5000,
             description="Default number of orphaned files to display (0 = unlimited).",
@@ -1373,7 +1443,7 @@ class Pipe:
             description="Hard cap for scan results.",
         )
         STORAGE_SCAN_DEFAULT_LIMIT: int = Field(
-            default=25,
+            default=5,
             ge=0,
             le=5000,
             description="Default number of storage mismatches to display (0 = unlimited).",
@@ -1391,7 +1461,7 @@ class Pipe:
             description="Rows fetched per database batch when scanning.",
         )
         CHAT_SCAN_DEFAULT_LIMIT: int = Field(
-            default=0,
+            default=5,
             ge=0,
             le=5000,
             description="How many problematic chats to list per chat-scan command (0 = no limit).",
@@ -1403,7 +1473,7 @@ class Pipe:
             description="Hard cap for chat scan output rows.",
         )
         CHAT_REPAIR_DEFAULT_LIMIT: int = Field(
-            default=10,
+            default=5,
             ge=0,
             le=200,
             description="How many chats to repair per run (0 = no cap).",
@@ -1421,7 +1491,7 @@ class Pipe:
             description="Rows fetched from the chat table per batch when scanning.",
         )
         IMAGE_SCAN_DEFAULT_LIMIT: int = Field(
-            default=25,
+            default=5,
             ge=0,
             le=5000,
             description="Default number of users shown in image-scan (0 = unlimited).",
@@ -1433,7 +1503,7 @@ class Pipe:
             description="Hard cap for image-scan rows.",
         )
         IMAGE_DETACH_DEFAULT_LIMIT: int = Field(
-            default=10,
+            default=5,
             ge=0,
             le=200,
             description="How many chats to process per image-detach command (0 = no cap).",
@@ -1446,6 +1516,7 @@ class Pipe:
         )
 
     def __init__(self):
+        """Instantiate helper services and apply the initial logging valve."""
         self.valves = self.Valves()
         self.service = UploadAuditService(chunk_size=self.valves.DB_CHUNK_SIZE)
         self.chat_service = ChatRepairService(chunk_size=self.valves.CHAT_DB_CHUNK_SIZE)
@@ -1454,11 +1525,13 @@ class Pipe:
         self._apply_logging_valve()
 
     def _apply_logging_valve(self) -> None:
+        """Set the module log level according to the ENABLE_LOGGING valve."""
         level = logging.DEBUG if self.valves.ENABLE_LOGGING else logging.INFO
         logger.setLevel(level)
         logger.propagate = True
 
     async def pipes(self) -> List[dict]:
+        """Expose metadata for the Open WebUI functions registry."""
         return [{"id": self.PIPE_ID, "name": self.PIPE_NAME}]
 
     async def pipe(
@@ -1468,6 +1541,7 @@ class Pipe:
         __request__: Request,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> StreamingResponse | PlainTextResponse:
+        """Parse the incoming chat message, execute the command, and stream the result."""
         command_text = self._extract_prompt_text(body)
         if not command_text:
             return await self._respond(True, self._help_markdown(), body)
@@ -1661,7 +1735,7 @@ class Pipe:
 
             if command == "chat-repair":
                 if not options.get("confirm"):
-                    reminder = "Add `confirm` to run repairs (example: `chat-repair confirm limit=10`)."
+                    reminder = "Add `confirm` to run repairs (example: `chat-repair confirm limit=5`)."
                     return await self._respond(False, reminder, body)
                 target_ids = list(id_options)
                 if not target_ids:
@@ -1798,7 +1872,7 @@ class Pipe:
 
             if command in {"db-clean", "db-clean-missing-files"}:
                 if not options.get("confirm"):
-                    reminder = "Add `confirm` to remove database records whose files are missing (example: `db-clean-missing-files confirm limit=10`)."
+                    reminder = "Add `confirm` to remove database records whose files are missing (example: `db-clean-missing-files confirm limit=5`)."
                     return await self._respond(False, reminder, body)
                 limit = self._clamp_limit(
                     limit_option,
@@ -1836,7 +1910,7 @@ class Pipe:
                 if not options.get("confirm"):
                     reminder = (
                         "Add `confirm` to remove database rows (and their binaries) for uploads with no references "
-                        "(example: `db-clean-orphan-files confirm limit=10`)."
+                        "(example: `db-clean-orphan-files confirm limit=5`)."
                     )
                     return await self._respond(False, reminder, body)
                 limit = self._clamp_limit(
@@ -1876,7 +1950,7 @@ class Pipe:
 
             if command == "storage-clean":
                 if not options.get("confirm"):
-                    reminder = "Add `confirm` to delete files on disk that are no longer tracked in the database (example: `storage-clean confirm limit=10`)."
+                    reminder = "Add `confirm` to delete files on disk that are no longer tracked in the database (example: `storage-clean confirm limit=5`)."
                     return await self._respond(False, reminder, body)
                 limit = self._clamp_limit(
                     limit_option,
@@ -1919,6 +1993,7 @@ class Pipe:
             return await self._respond(False, f"Unable to complete command: {exc}", body)
 
     async def _respond(self, ok: bool, message: str, body: dict):
+        """Return either a plain response or an SSE stream depending on the request."""
         is_stream = bool(body.get("stream"))
         status_code = 200 if ok else 400
         if not is_stream:
@@ -2629,7 +2704,7 @@ class Pipe:
 
         lines.append("")
         lines.append(
-            "Next step: run `chat-repair confirm limit=10` (or `limit=0` for no cap) to clean the listed chats."
+            "Next step: run `chat-repair confirm limit=5` (or `limit=0` for no cap) to clean the listed chats."
         )
         return "\n".join(lines)
 
@@ -2857,7 +2932,7 @@ class Pipe:
         session,
         user_id: str,
         *,
-        limit: int = 10,
+        limit: int = 5,
     ) -> List[Dict[str, Any]]:
         import heapq
 
@@ -2883,7 +2958,7 @@ class Pipe:
         session,
         user_id: str,
         *,
-        limit: int = 10,
+        limit: int = 5,
     ) -> List[Dict[str, Any]]:
         import heapq
 
@@ -2909,7 +2984,7 @@ class Pipe:
         user_id: str,
         label: str,
         *,
-        limit: int = 10,
+        limit: int = 5,
     ) -> str:
         with get_db() as db:
             chats = self._get_top_user_chats(db, user_id, limit=limit)
@@ -3099,6 +3174,7 @@ class Pipe:
         detail_user_id: Optional[str],
         detail_label: Optional[str],
     ) -> StreamingResponse:
+        """Stream user usage rows as they are computed in a background thread."""
         header = self._user_report_header()
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
@@ -3184,6 +3260,7 @@ class Pipe:
         *,
         limit: int,
     ) -> str:
+        """Render a Markdown table summarizing per-user usage statistics."""
         rows = self._prepare_user_report_rows(users, usage, limit=limit)
         return self._render_user_report(rows)
 
@@ -3452,7 +3529,7 @@ These commands operate only on the `file` table and its metadata.
 - `db-clean-missing-files confirm [limit=<n>] [...]` *(alias: `db-clean`)*
   - **Purpose:** Remove the database rows that `db-scan` proved were already missing their binaries.
   - **Safety:** Requires the literal word `confirm`, respects `limit`, deletes in small batches by default, and prints a table of every row removed (owner, filename, path, last update) for compliance records.
-  - **Best practice:** Start with conservative limits (for example `limit=10`) in production and widen only after verifying results.
+      - **Best practice:** Start with conservative limits (for example `limit=5`) in production and widen only after verifying results—the intentionally low default helps limit any damage if a scope turns out to be broader than expected.
 - `db-clean-orphan-files confirm [limit=<n>] [...]`
   - **Purpose:** Delete uploads that still exist on disk but have zero references in chats or knowledge bases (the “Orphaned files (no remaining references)” group from `db-scan`).
   - **Safety:** Removes both the database row and the binary via `Files.delete_file_by_id`, honors `limit`, and produces the same audit table as other clean commands.
@@ -3481,8 +3558,8 @@ These commands audit stored chats for malformed Unicode (null bytes, orphaned su
 
 - `chat-repair confirm [limit=<n>] [user=<id>|user=me] [user_query="name"] [id=<chat-id>]`
   - **Purpose:** Apply the same sanitization logic as `chat-scan` but persist the cleaned values back to the `chat` table.
-  - **Safety:** Requires `confirm`, honors `limit` (default 10, `limit=0` for unlimited), and shows a sample of the chats it fixed so you can audit changes.
-  - **Best practice:** Run `chat-scan` first, then feed the resulting chat IDs (or rely on automatic history scraping) into `chat-repair confirm limit=10`.
+      - **Safety:** Requires `confirm`, honors `limit` (default 5, `limit=0` for unlimited), and shows a sample of the chats it fixed so you can audit changes.
+      - **Best practice:** Run `chat-scan` first, then feed the resulting chat IDs (or rely on automatic history scraping) into `chat-repair confirm limit=5`; the reduced default is intentional to limit damage if repairs go sideways.
 
 ## Image maintenance
 Inline images embedded as `data:image/...;base64` strings bloat the database and bypass access controls. Use these commands to locate and normalize them.
@@ -3494,7 +3571,7 @@ Inline images embedded as `data:image/...;base64` strings bloat the database and
 
 - `image-detach confirm [limit=<n>] [user=<id>|user=me] [user_query="name"] [id=<chat-id>]`
   - **Purpose:** Convert those inline blobs into proper Open WebUI files by uploading them via the storage provider and rewriting the chat Markdown to reference `/api/v1/files/{id}/content`.
-  - **Safety:** Requires `confirm`, honors `limit` (default 10 chats per run, `limit=0` for no cap), and records the chats/files it touched so you can track changes.
+  - **Safety:** Requires `confirm`, honors `limit` (default 5 chats per run, `limit=0` for no cap), and records the chats/files it touched so you can track changes so any accidental scope issues stay small.
   - **Best practice:** Start with targeted scopes (e.g., `user=...` or `user_query="team"`) and keep copies of `image-scan` reports for change-control documentation.
 
 ## User usage reporting

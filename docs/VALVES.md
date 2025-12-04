@@ -7,17 +7,17 @@ Each valve is validated (min/max) before the pipe boots. Invalid values fall bac
 | Valve | Type | Default | Range | When to change |
 | --- | --- | --- | --- | --- |
 | `ENABLE_LOGGING` | bool | `False` | `True`/`False` | Turn on when you want INFO-level logs for each scan stage (helpful during incident response). |
-| `SCAN_DEFAULT_LIMIT` | int | `25` | `0 – 5000` | Set to `0` if you always want the full orphaned-file list without specifying `limit=0`. |
+| `SCAN_DEFAULT_LIMIT` | int | `5` | `0 – 5000` | Conservative default for database scans; raise only after reviewing initial rows. |
 | `SCAN_MAX_LIMIT` | int | `500` | `25 – 2000` | Absolute ceiling for `limit=`. Raise cautiously if you expect thousands of orphaned files. |
-| `STORAGE_SCAN_DEFAULT_LIMIT` | int | `25` | `0 – 5000` | Default number of storage mismatches reported (and cleaned) per run. |
+| `STORAGE_SCAN_DEFAULT_LIMIT` | int | `5` | `0 – 5000` | Default number of storage mismatches reported (and cleaned) per run. |
 | `STORAGE_SCAN_MAX_LIMIT` | int | `500` | `25 – 2000` | Hard ceiling for storage scans/cleanups—raise carefully if you expect huge backlogs. |
-| `CHAT_SCAN_DEFAULT_LIMIT` | int | `0` | `0 – 5000` | Default chat rows listed during `chat-scan` (0 = unlimited stream). |
+| `CHAT_SCAN_DEFAULT_LIMIT` | int | `5` | `0 – 5000` | Default chat rows listed during `chat-scan` (0 = unlimited stream). |
 | `CHAT_SCAN_MAX_LIMIT` | int | `200` | `25 – 1000` | Hard ceiling for `chat-scan` output. |
-| `CHAT_REPAIR_DEFAULT_LIMIT` | int | `10` | `0 – 200` | Default number of chats repaired per `chat-repair` run (0 = unlimited). |
+| `CHAT_REPAIR_DEFAULT_LIMIT` | int | `5` | `0 – 200` | Default number of chats repaired per `chat-repair` run (0 = unlimited). |
 | `CHAT_REPAIR_MAX_LIMIT` | int | `200` | `10 – 1000` | Safety net for chat repair batches. |
-| `IMAGE_SCAN_DEFAULT_LIMIT` | int | `25` | `0 – 5000` | Default number of users listed per `image-scan` invocation (0 = unlimited). |
+| `IMAGE_SCAN_DEFAULT_LIMIT` | int | `5` | `0 – 5000` | Default number of users listed per `image-scan` invocation (0 = unlimited). |
 | `IMAGE_SCAN_MAX_LIMIT` | int | `200` | `25 – 2000` | Hard ceiling for image-scan rows. |
-| `IMAGE_DETACH_DEFAULT_LIMIT` | int | `10` | `0 – 200` | Default number of chats processed per `image-detach` run (0 = unlimited). |
+| `IMAGE_DETACH_DEFAULT_LIMIT` | int | `5` | `0 – 200` | Default number of chats processed per `image-detach` run (0 = unlimited). |
 | `IMAGE_DETACH_MAX_LIMIT` | int | `200` | `10 – 1000` | Safety ceiling for image-detach batches. |
 | `DB_CHUNK_SIZE` | int | `400` | `50 – 2000` | Rows fetched per SQLAlchemy batch for file/storage operations. |
 | `CHAT_DB_CHUNK_SIZE` | int | `200` | `50 – 1000` | Chat rows fetched per batch during `chat-scan`/`chat-repair`. |
