@@ -2625,8 +2625,15 @@ class Pipe:
             candidate = (self.upload_root / candidate).resolve()
         else:
             candidate = candidate.resolve()
-        if not str(candidate).startswith(str(self.upload_root)):
+
+        # Check if the resolved candidate is within the upload directory
+        try:
+            # Use relative_to() for robust path containment check (more Pythonic than str.startswith)
+            candidate.relative_to(self.upload_root)
+        except ValueError:
+            # relative_to() raises ValueError if candidate is not under upload_root
             raise ValueError("Path/prefix must stay within the upload directory.")
+
         return str(candidate)
 
     @staticmethod
