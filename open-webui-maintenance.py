@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
-from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from uuid import UUID
 
 from fastapi import Request
@@ -150,6 +150,89 @@ class InlineImageSkipRecord:
     skipped_images: int
     skipped_bytes: int
     reasons: Dict[str, int]
+
+
+def sanitize_unicode(
+    value: str,
+    *,
+    track_counts: bool = False,
+    replace_char: str = "\ufffd"
+) -> Union[str, Tuple[str, Counter, bool]]:
+    """Remove null bytes and lone surrogates from Unicode strings.
+
+    Args:
+        value: String to sanitize
+        track_counts: If True, return (str, Counter, bool). If False, return str only.
+        replace_char: Character to use for replacing invalid surrogates (default: U+FFFD)
+
+    Returns:
+        If track_counts=True: (sanitized_string, counts_dict, changed_flag)
+        If track_counts=False: sanitized_string
+
+    The counts dict contains keys: 'null_bytes', 'lone_high', 'lone_low', 'strings_touched'
+    """
+    if not value:
+        return (value, Counter(), False) if track_counts else value
+
+    counts: Counter = Counter()
+    builder: List[str] = []
+    changed = False
+    i = 0
+    length = len(value)
+
+    while i < length:
+        ch = value[i]
+        code = ord(ch)
+
+        # Null byte - always skip
+        if ch == "\x00":
+            if track_counts:
+                counts["null_bytes"] += 1
+            changed = True
+            i += 1
+            continue
+
+        # High surrogate (0xD800-0xDBFF)
+        if 0xD800 <= code <= 0xDBFF:
+            # Check if followed by low surrogate (valid pair)
+            if i + 1 < length:
+                next_code = ord(value[i + 1])
+                if 0xDC00 <= next_code <= 0xDFFF:
+                    # Valid surrogate pair - keep both
+                    builder.append(ch)
+                    builder.append(value[i + 1])
+                    i += 2
+                    continue
+            # Lone high surrogate - replace
+            if track_counts:
+                counts["lone_high"] += 1
+            builder.append(replace_char)
+            changed = True
+            i += 1
+            continue
+
+        # Low surrogate (0xDC00-0xDFFF) without preceding high
+        if 0xDC00 <= code <= 0xDFFF:
+            if track_counts:
+                counts["lone_low"] += 1
+            builder.append(replace_char)
+            changed = True
+            i += 1
+            continue
+
+        # Normal character
+        builder.append(ch)
+        i += 1
+
+    sanitized = "".join(builder)
+
+    if track_counts:
+        if changed:
+            counts["strings_touched"] += 1
+            return sanitized, counts, True
+        return value, counts, False
+
+    return sanitized
 
 
 class BaseChatService:
@@ -984,55 +1067,12 @@ class ChatRepairService(BaseChatService):
 
         return value, False, Counter()
 
-    def _sanitize_string(self, value: str):
-        if not value:
-            return value, Counter(), False
-
-        counts: Counter = Counter()
-        builder: List[str] = []
-        changed = False
-        i = 0
-        length = len(value)
-
-        while i < length:
-            ch = value[i]
-            code = ord(ch)
-
-            if ch == "\x00":
-                counts["null_bytes"] += 1
-                changed = True
-                i += 1
-                continue
-
-            if 0xD800 <= code <= 0xDBFF:
-                if i + 1 < length:
-                    next_code = ord(value[i + 1])
-                    if 0xDC00 <= next_code <= 0xDFFF:
-                        builder.append(ch)
-                        builder.append(value[i + 1])
-                        i += 2
-                        continue
-                counts["lone_high"] += 1
-                builder.append("\ufffd")
-                changed = True
-                i += 1
-                continue
-
-            if 0xDC00 <= code <= 0xDFFF:
-                counts["lone_low"] += 1
-                builder.append("\ufffd")
-                changed = True
-                i += 1
-                continue
-
-            builder.append(ch)
-            i += 1
-
-        sanitized = "".join(builder)
-        if changed:
-            counts["strings_touched"] += 1
-            return sanitized, counts, True
-        return value, counts, False
+    def _sanitize_string(self, value: str) -> Tuple[str, Counter, bool]:
+        """Sanitize a string by removing null bytes and lone surrogates."""
+        result = sanitize_unicode(value, track_counts=True)
+        # Type assertion: we know track_counts=True returns tuple
+        assert isinstance(result, tuple), "Expected tuple from sanitize_unicode"
+        return result
 
 
 class StorageInventory:
@@ -3478,38 +3518,15 @@ class Pipe:
         return safe
 
     def _sanitize_output_text(self, text: Optional[str]) -> str:
+        """Sanitize output text by removing null bytes and lone surrogates."""
         if text is None:
             return ""
         value = str(text)
         if not value:
             return ""
-        builder: List[str] = []
-        i = 0
-        length = len(value)
-        while i < length:
-            ch = value[i]
-            code = ord(ch)
-            if ch == "\x00":
-                i += 1
-                continue
-            if 0xD800 <= code <= 0xDBFF:
-                if i + 1 < length:
-                    next_code = ord(value[i + 1])
-                    if 0xDC00 <= next_code <= 0xDFFF:
-                        builder.append(ch)
-                        builder.append(value[i + 1])
-                        i += 2
-                        continue
-                builder.append("\ufffd")
-                i += 1
-                continue
-            if 0xDC00 <= code <= 0xDFFF:
-                builder.append("\ufffd")
-                i += 1
-                continue
-            builder.append(ch)
-            i += 1
-        return "".join(builder)
+        result = sanitize_unicode(value, track_counts=False)
+        assert isinstance(result, str), "Expected string from sanitize_unicode"
+        return result
 
     async def _resolve_user_labels(self, user_ids: Iterable[str]) -> Dict[str, str]:
         unique_ids = sorted({uid for uid in user_ids if uid})
