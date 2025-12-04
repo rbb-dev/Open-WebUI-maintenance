@@ -152,7 +152,83 @@ class InlineImageSkipRecord:
     reasons: Dict[str, int]
 
 
-class InlineImageService:
+class BaseChatService:
+    """Shared query utilities for services that iterate over chat records."""
+
+    def __init__(self, chunk_size: int = 200):
+        """Initialize the service with safe database batch sizes."""
+        self.chunk_size = max(50, chunk_size)
+
+    def _build_query(
+        self,
+        session,
+        *,
+        user_filter: Optional[str],
+        chat_ids: Optional[Sequence[str]],
+    ):
+        """Create a chat query scoped to one user or explicit chat IDs."""
+        query = session.query(Chat)
+        if user_filter:
+            query = query.filter(Chat.user_id == user_filter)
+        if chat_ids:
+            ids = [cid for cid in chat_ids if cid]
+            if ids:
+                query = query.filter(Chat.id.in_(ids))
+            else:
+                query = query.filter(False)
+        return query.order_by(Chat.updated_at.desc())
+
+    def _collect_user_batches(
+        self,
+        session,
+        *,
+        user_filter: Optional[str],
+        user_query: Optional[str],
+        chat_ids: Optional[Sequence[str]],
+    ) -> List[Tuple[str, int]]:
+        """Return (user_id, chat_count) pairs honoring current filters."""
+        query = session.query(Chat.user_id, func.count(Chat.id))
+        if user_filter:
+            query = query.filter(Chat.user_id == user_filter)
+        if user_query:
+            user_ids = self._lookup_user_ids_by_query(session, user_query)
+            if not user_ids:
+                return []
+            query = query.filter(Chat.user_id.in_(user_ids))
+        if chat_ids:
+            ids = [cid for cid in chat_ids if cid]
+            if ids:
+                query = query.filter(Chat.id.in_(ids))
+            else:
+                return []
+        query = query.group_by(Chat.user_id)
+        return [(row[0], int(row[1])) for row in query]
+
+    def _lookup_user_ids_by_query(self, session, query: str, limit: int = 50) -> List[str]:
+        """Fuzzy match users and return a bounded list of IDs."""
+        from open_webui.models.users import User
+
+        text = (query or "").strip()
+        if not text:
+            return []
+        escaped = text.replace("%", "\\%").replace("_", "\\_")
+        like_pattern = f"%{escaped}%"
+        user_rows = (
+            session.query(User.id)
+            .filter(
+                or_(
+                    User.name.ilike(like_pattern),
+                    User.username.ilike(like_pattern),
+                    User.email.ilike(like_pattern),
+                )
+            )
+            .limit(limit)
+            .all()
+        )
+        return [row[0] for row in user_rows]
+
+
+class InlineImageService(BaseChatService):
     """Find and normalize inline base64 images embedded inside chat payloads."""
     MARKDOWN_DATA_URI_PATTERN = re.compile(
         r"!\[(?P<alt>[^\]]*)\]\(data:(?P<mime>[^;]+);base64,(?P<data>[^)]+)\)", re.IGNORECASE
@@ -169,10 +245,6 @@ class InlineImageService:
         "image/gif": "gif",
     }
     MAX_STRING_MAP_DEPTH = 1000
-
-    def __init__(self, chunk_size: int = 200):
-        """Initialize the service with safe database batch sizes."""
-        self.chunk_size = max(50, chunk_size)
 
     def scan(
         self,
@@ -538,74 +610,6 @@ class InlineImageService:
             return inserted.id, None
         return None, "db_error"
 
-    def _collect_user_batches(
-        self,
-        session,
-        *,
-        user_filter: Optional[str],
-        user_query: Optional[str],
-        chat_ids: Optional[Sequence[str]],
-    ) -> List[Tuple[str, int]]:
-        """Return (user_id, chat_count) pairs honoring current filters."""
-        query = session.query(Chat.user_id, func.count(Chat.id))
-        if user_filter:
-            query = query.filter(Chat.user_id == user_filter)
-        if user_query:
-            user_ids = self._lookup_user_ids_by_query(session, user_query)
-            if not user_ids:
-                return []
-            query = query.filter(Chat.user_id.in_(user_ids))
-        if chat_ids:
-            ids = [cid for cid in chat_ids if cid]
-            if ids:
-                query = query.filter(Chat.id.in_(ids))
-            else:
-                return []
-        query = query.group_by(Chat.user_id)
-        return [(row[0], int(row[1])) for row in query]
-
-    def _lookup_user_ids_by_query(self, session, query: str, limit: int = 50) -> List[str]:
-        """Fuzzy match users and return a bounded list of IDs."""
-        from open_webui.models.users import User
-
-        text = (query or "").strip()
-        if not text:
-            return []
-        escaped = text.replace("%", "\\%").replace("_", "\\_")
-        like_pattern = f"%{escaped}%"
-        user_rows = (
-            session.query(User.id)
-            .filter(
-                or_(
-                    User.name.ilike(like_pattern),
-                    User.username.ilike(like_pattern),
-                    User.email.ilike(like_pattern),
-                )
-            )
-            .limit(limit)
-            .all()
-        )
-        return [row[0] for row in user_rows]
-
-    def _build_query(
-        self,
-        session,
-        *,
-        user_filter: Optional[str],
-        chat_ids: Optional[Sequence[str]],
-    ):
-        """Create a chat query scoped to one user or explicit chat IDs."""
-        query = session.query(Chat)
-        if user_filter:
-            query = query.filter(Chat.user_id == user_filter)
-        if chat_ids:
-            ids = [cid for cid in chat_ids if cid]
-            if ids:
-                query = query.filter(Chat.id.in_(ids))
-            else:
-                query = query.filter(False)
-        return query.order_by(Chat.updated_at.desc())
-
     def _extract_inline_images(self, payload: Any) -> List[InlineImageMatch]:
         """Traverse a payload and collect every inline-image reference."""
         data = self._ensure_payload(payload)
@@ -718,13 +722,10 @@ class InlineImageService:
         data = match.group("data") or ""
         return {"mime": mime, "data": data}
 
-class ChatRepairService:
+class ChatRepairService(BaseChatService):
     """Encapsulates scanning and repair logic so it can run in a thread."""
 
     DETAIL_SAMPLE_MAX = 20
-
-    def __init__(self, chunk_size: int = 200):
-        self.chunk_size = max(50, chunk_size)
 
     def scan(
         self,
@@ -894,71 +895,6 @@ class ChatRepairService:
             "counters": dict(summary_counter),
             "has_more": has_more,
         }
-
-    def _build_query(
-        self,
-        session,
-        *,
-        user_filter: Optional[str],
-        chat_ids: Optional[Sequence[str]],
-    ):
-        query = session.query(Chat)
-        if user_filter:
-            query = query.filter(Chat.user_id == user_filter)
-        if chat_ids:
-            ids = [cid for cid in chat_ids if cid]
-            if ids:
-                query = query.filter(Chat.id.in_(ids))
-            else:
-                query = query.filter(False)
-        return query.order_by(Chat.updated_at.desc())
-
-    def _collect_user_batches(
-        self,
-        session,
-        *,
-        user_filter: Optional[str],
-        user_query: Optional[str],
-        chat_ids: Optional[Sequence[str]],
-    ) -> List[Tuple[str, int]]:
-        query = session.query(Chat.user_id, func.count(Chat.id))
-        if user_filter:
-            query = query.filter(Chat.user_id == user_filter)
-        if user_query:
-            user_ids = self._lookup_user_ids_by_query(session, user_query)
-            if not user_ids:
-                return []
-            query = query.filter(Chat.user_id.in_(user_ids))
-        if chat_ids:
-            ids = [cid for cid in chat_ids if cid]
-            if ids:
-                query = query.filter(Chat.id.in_(ids))
-            else:
-                return []
-        query = query.group_by(Chat.user_id)
-        return [(row[0], int(row[1])) for row in query]
-
-    def _lookup_user_ids_by_query(self, session, query: str, limit: int = 50) -> List[str]:
-        from open_webui.models.users import User
-
-        text = (query or "").strip()
-        if not text:
-            return []
-        escaped = text.replace("%", "\\%").replace("_", "\\_")
-        like_pattern = f"%{escaped}%"
-        user_rows = (
-            session.query(User.id)
-            .filter(
-                or_(
-                    User.name.ilike(like_pattern),
-                    User.username.ilike(like_pattern),
-                    User.email.ilike(like_pattern),
-                )
-            )
-            .limit(limit)
-            .all()
-        )
-        return [row[0] for row in user_rows]
 
     def _analyse_chat(self, chat: Chat, *, mutate: bool) -> ChatSanitizeReport:
         counts: Counter = Counter()
