@@ -1701,7 +1701,7 @@ class Pipe:
                         user_sorter=user_sorter,
                     )
                 status_callback = self._threadsafe_user_status_callback(
-                    loop, __event_emitter__, status_cache, action="Scanning"
+                    loop, __event_emitter__, status_cache, action="Scanning", purpose="for malformed Unicode"
                 )
                 limit = self._clamp_limit(
                     limit_option,
@@ -1743,7 +1743,7 @@ class Pipe:
                 repair_status_cache: Dict[str, str] = {}
                 repair_user_sorter = self._make_user_sorter(repair_status_cache)
                 status_callback = self._threadsafe_user_status_callback(
-                    loop, __event_emitter__, repair_status_cache, action="Repairing"
+                    loop, __event_emitter__, repair_status_cache, action="Repairing", purpose="for malformed Unicode"
                 )
                 limit = self._clamp_limit(
                     limit_option,
@@ -1794,7 +1794,7 @@ class Pipe:
                         user_sorter=user_sorter,
                     )
                 status_callback = self._threadsafe_user_status_callback(
-                    loop, __event_emitter__, status_cache, action="Scanning"
+                    loop, __event_emitter__, status_cache, action="Scanning", purpose="for inline images"
                 )
                 limit = self._clamp_limit(
                     limit_option,
@@ -1838,7 +1838,7 @@ class Pipe:
                 detach_status_cache: Dict[str, str] = {}
                 detach_user_sorter = self._make_user_sorter(detach_status_cache)
                 status_callback = self._threadsafe_user_status_callback(
-                    loop, __event_emitter__, detach_status_cache, action="Detaching"
+                    loop, __event_emitter__, detach_status_cache, action="Detaching", purpose="inline images from"
                 )
                 limit = self._clamp_limit(
                     limit_option,
@@ -2064,6 +2064,7 @@ class Pipe:
         cache: Dict[str, str],
         *,
         action: str = "Scanning",
+        purpose: str = "for malformed Unicode",
     ) -> Callable[[str, int], None]:
         seen_users: set[str] = set()
 
@@ -2073,7 +2074,7 @@ class Pipe:
                 return
             seen_users.add(user_id)
             label = self._lookup_user_label_sync(user_id, cache)
-            message = f"{action} {label}'s chats for corruption (total chats: {chat_count})"
+            message = f"{action} {label}'s chats {purpose} (total chats: {chat_count})"
             logger.info(message)
             if not emitter:
                 return
@@ -2121,7 +2122,7 @@ class Pipe:
         queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
         stream_user_cache: Dict[str, str] = {}
         status_callback = self._threadsafe_user_status_callback(
-            loop, emitter, status_cache, action="Scanning"
+            loop, emitter, status_cache, action="Scanning", purpose="for malformed Unicode"
         )
         result_callback = self._threadsafe_result_callback(loop, queue)
         scope = self._describe_scope(
@@ -2225,7 +2226,7 @@ class Pipe:
         queue: "asyncio.Queue[Optional[InlineImageUserSummary]]" = asyncio.Queue()
         stream_user_cache: Dict[str, str] = {}
         status_callback = self._threadsafe_user_status_callback(
-            loop, emitter, status_cache, action="Scanning"
+            loop, emitter, status_cache, action="Scanning", purpose="for inline images"
         )
         thread_cancel = threading.Event()
 
