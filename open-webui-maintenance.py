@@ -3534,17 +3534,34 @@ class Pipe:
             return {}
 
         def _load(ids: Sequence[str]):
+            from open_webui.models.users import User
+
             mapping: Dict[str, str] = {}
-            for uid in ids:
+            with get_db() as db:
                 try:
-                    user = Users.get_user_by_id(uid)
+                    # Batch fetch all users in one query instead of N queries
+                    users = db.query(User).filter(User.id.in_(ids)).all()
+                    user_map = {user.id: user for user in users}
+
+                    for uid in ids:
+                        user = user_map.get(uid)
+                        if user:
+                            label = getattr(user, "name", None) or getattr(user, "username", None) or getattr(user, "email", None)
+                            mapping[uid] = label or uid
+                        else:
+                            mapping[uid] = uid
                 except Exception:
-                    user = None
-                if user:
-                    label = getattr(user, "name", None) or getattr(user, "username", None) or getattr(user, "email", None)
-                    mapping[uid] = label or uid
-                else:
-                    mapping[uid] = uid
+                    # Fallback to one-by-one if batch query fails
+                    for uid in ids:
+                        try:
+                            user = Users.get_user_by_id(uid)
+                        except Exception:
+                            user = None
+                        if user:
+                            label = getattr(user, "name", None) or getattr(user, "username", None) or getattr(user, "email", None)
+                            mapping[uid] = label or uid
+                        else:
+                            mapping[uid] = uid
             return mapping
 
         return await asyncio.to_thread(_load, unique_ids)
