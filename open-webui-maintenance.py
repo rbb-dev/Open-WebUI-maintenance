@@ -141,6 +141,17 @@ class InlineImageDetachRecord:
     file_ids: List[str]
 
 
+@dataclass
+class InlineImageSkipRecord:
+    """Per-chat summary for inline images we couldn't detach."""
+
+    chat_id: str
+    user_id: Optional[str]
+    skipped_images: int
+    skipped_bytes: int
+    reasons: Dict[str, int]
+
+
 class InlineImageService:
     """Find and normalize inline base64 images embedded inside chat payloads."""
     MARKDOWN_DATA_URI_PATTERN = re.compile(
@@ -250,6 +261,11 @@ class InlineImageService:
         total_bytes = 0
         has_more = False
         records: List[InlineImageDetachRecord] = []
+        skipped_chats = 0
+        skipped_images = 0
+        skipped_bytes = 0
+        skipped_reason_counter: Counter[str] = Counter()
+        skipped_records: List[InlineImageSkipRecord] = []
 
         with get_db() as db:
             user_batches = self._collect_user_batches(
@@ -276,7 +292,23 @@ class InlineImageService:
                         has_more = True
                         break
                     result = self._detach_from_chat(db, chat)
+                    matches_detected = result.get("matches_detected", result["images_detached"])
+                    if matches_detected == 0:
+                        continue
                     if result["images_detached"] == 0:
+                        skipped_chats += 1
+                        skipped_images += result.get("skipped_images", 0)
+                        skipped_bytes += result.get("skipped_bytes", 0)
+                        skipped_reason_counter.update(result.get("skipped_reasons", {}))
+                        skipped_records.append(
+                            InlineImageSkipRecord(
+                                chat_id=chat.id,
+                                user_id=chat.user_id,
+                                skipped_images=result.get("skipped_images", 0),
+                                skipped_bytes=result.get("skipped_bytes", 0),
+                                reasons=dict(result.get("skipped_reasons", {})),
+                            )
+                        )
                         continue
                     processed += 1
                     total_images += result["images_detached"]
@@ -302,6 +334,11 @@ class InlineImageService:
             "images_detached": total_images,
             "bytes_detached": total_bytes,
             "records": records,
+            "skipped_chats": skipped_chats,
+            "skipped_images": skipped_images,
+            "skipped_bytes": skipped_bytes,
+            "skipped_reason_counts": dict(skipped_reason_counter),
+            "skipped_records": skipped_records,
             "has_more": has_more,
         }
 
@@ -335,21 +372,56 @@ class InlineImageService:
         try:
             new_payload, matches_info = self._map_strings(payload, handler)
         except ValueError:
-            return {"images_detached": 0, "bytes_detached": 0, "file_ids": []}
+            return {
+                "images_detached": 0,
+                "bytes_detached": 0,
+                "file_ids": [],
+                "matches_detected": 0,
+                "skipped_images": 0,
+                "skipped_bytes": 0,
+                "skipped_reasons": Counter(),
+            }
         if not matches_info:
-            return {"images_detached": 0, "bytes_detached": 0, "file_ids": []}
+            return {
+                "images_detached": 0,
+                "bytes_detached": 0,
+                "file_ids": [],
+                "matches_detected": 0,
+                "skipped_images": 0,
+                "skipped_bytes": 0,
+                "skipped_reasons": Counter(),
+            }
+
+        successes = [entry for entry in matches_info if entry.get("status") == "detached"]
+        skipped = [entry for entry in matches_info if entry.get("status") == "skipped"]
+        skipped_counter = Counter(entry.get("reason", "unknown") for entry in skipped)
+        skipped_bytes = sum(int(entry.get("bytes", 0)) for entry in skipped)
+        if not successes:
+            return {
+                "images_detached": 0,
+                "bytes_detached": 0,
+                "file_ids": [],
+                "matches_detected": len(skipped),
+                "skipped_images": len(skipped),
+                "skipped_bytes": skipped_bytes,
+                "skipped_reasons": skipped_counter,
+            }
 
         chat.chat = json.loads(json.dumps(new_payload))
         chat.updated_at = max(int(time.time()), chat.updated_at or 0)
         flag_modified(chat, "chat")
         session.flush()
 
-        file_ids = [entry["file_id"] for entry in matches_info]
-        total_bytes = sum(entry["bytes"] for entry in matches_info)
+        file_ids = [entry["file_id"] for entry in successes]
+        total_bytes = sum(int(entry.get("bytes", 0)) for entry in successes)
         return {
-            "images_detached": len(matches_info),
+            "images_detached": len(successes),
             "bytes_detached": total_bytes,
             "file_ids": file_ids,
+            "matches_detected": len(successes) + len(skipped),
+            "skipped_images": len(skipped),
+            "skipped_bytes": skipped_bytes,
+            "skipped_reasons": skipped_counter,
         }
 
     def _replace_inline_images(
@@ -361,16 +433,25 @@ class InlineImageService:
         trimmed = text.strip()
         bare_data = self._parse_data_uri(trimmed)
         if bare_data:
-            file_id = self._persist_inline_image(user_id, bare_data["mime"], bare_data["data"])
-            if not file_id:
-                return text, []
+            file_id, error_reason = self._persist_inline_image(user_id, bare_data["mime"], bare_data["data"])
             approx_bytes = self._estimate_base64_size(bare_data["data"])
+            if not file_id:
+                return text, [
+                    {
+                        "status": "skipped",
+                        "reason": error_reason or "persist_failed",
+                        "bytes": approx_bytes,
+                        "mime": bare_data["mime"],
+                    }
+                ]
             replacement_url = f"/api/v1/files/{file_id}/content"
             if trimmed == text:
                 new_text = replacement_url
             else:
                 new_text = text.replace(trimmed, replacement_url, 1)
-            return new_text, [{"file_id": file_id, "bytes": approx_bytes}]
+            return new_text, [
+                {"status": "detached", "file_id": file_id, "bytes": approx_bytes}
+            ]
 
         matches = list(self.MARKDOWN_DATA_URI_PATTERN.finditer(text))
         if not matches:
@@ -383,20 +464,33 @@ class InlineImageService:
             alt_text = match.group("alt") or ""
             mime_type = (match.group("mime") or "").lower()
             base64_data = match.group("data") or ""
-            file_id = self._persist_inline_image(user_id, mime_type, base64_data)
+            file_id, error_reason = self._persist_inline_image(user_id, mime_type, base64_data)
+            approx_bytes = self._estimate_base64_size(base64_data)
             if not file_id:
+                entries.append(
+                    {
+                        "status": "skipped",
+                        "reason": error_reason or "persist_failed",
+                        "bytes": approx_bytes,
+                        "mime": mime_type,
+                    }
+                )
                 rebuilt.append(match.group(0))
                 last = match.end()
                 continue
             replacement = f"![{alt_text}](/api/v1/files/{file_id}/content)"
             rebuilt.append(replacement)
-            approx_bytes = self._estimate_base64_size(base64_data)
-            entries.append({"file_id": file_id, "bytes": approx_bytes})
+            entries.append({"status": "detached", "file_id": file_id, "bytes": approx_bytes})
             last = match.end()
         rebuilt.append(text[last:])
         return "".join(rebuilt), entries
 
-    def _persist_inline_image(self, user_id: Optional[str], mime_type: str, base64_data: str) -> Optional[str]:
+    def _persist_inline_image(
+        self,
+        user_id: Optional[str],
+        mime_type: str,
+        base64_data: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Decode, validate, and store a single base64 payload via Storage."""
         mime = mime_type.lower() if mime_type else "image/png"
         extension = self.SUPPORTED_MIME_EXTENSIONS.get(mime)
@@ -405,14 +499,14 @@ class InlineImageService:
             if guessed:
                 extension = guessed.lstrip(".")
         if not extension:
-            return None
+            return None, "unsupported_mime"
         try:
             cleaned = re.sub(r"\s+", "", base64_data or "")
             binary = base64.b64decode(cleaned, validate=True)
         except Exception:
-            return None
+            return None, "decode_error"
         if not binary:
-            return None
+            return None, "empty_payload"
         file_uuid = str(uuid.uuid4())
         filename = f"inline-image-{file_uuid}.{extension}"
         try:
@@ -425,7 +519,7 @@ class InlineImageService:
                 },
             )
         except Exception:
-            return None
+            return None, "storage_error"
         meta = {
             "name": filename,
             "content_type": mime,
@@ -440,7 +534,9 @@ class InlineImageService:
             meta=meta,
         )
         inserted = Files.insert_new_file(user_id or "system", form)
-        return inserted.id if inserted else None
+        if inserted:
+            return inserted.id, None
+        return None, "db_error"
 
     def _collect_user_batches(
         self,
@@ -2804,6 +2900,15 @@ class Pipe:
         lines.append(f"- Inline images detached: {result['images_detached']}")
         lines.append(f"- Bytes migrated to file store: {self._format_filesize(result['bytes_detached'])}")
         lines.append(f"- Scope: {scope}")
+        skipped_chats = result.get("skipped_chats", 0)
+        skipped_images = result.get("skipped_images", 0)
+        if skipped_chats:
+            lines.append(f"- Chats skipped (detachment failed): {skipped_chats}")
+        if skipped_images:
+            lines.append(f"- Inline images skipped: {skipped_images}")
+            reason_summary = self._format_skip_reason_summary(result.get("skipped_reason_counts", {}))
+            if reason_summary:
+                lines.append(f"- Skip reasons: {reason_summary}")
         if limit == 0:
             lines.append("- Limit: unlimited (ran until scope finished)")
         else:
@@ -2812,6 +2917,7 @@ class Pipe:
             lines.append("- Limit reached. Re-run the command to process more chats.")
         lines.append("")
         records: List[InlineImageDetachRecord] = result.get("records", [])
+        skipped_records: List[InlineImageSkipRecord] = result.get("skipped_records", [])
         if records:
             lines.append("| Chat ID | User | Images detached | Bytes moved |")
             lines.append("| --- | --- | --- | --- |")
@@ -2821,12 +2927,42 @@ class Pipe:
                     f"| `{record.chat_id}` | {label} | {record.images_detached} | "
                     f"{self._format_filesize(record.bytes_detached)} |"
                 )
-        else:
+        if not records and not skipped_records:
             lines.append("No chats required changes.")
+
+        if skipped_records:
+            lines.append("")
+            lines.append("#### Chats with inline images that could not be detached")
+            lines.append("| Chat ID | User | Inline images | Estimated size | Reasons |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for record in skipped_records:
+                label = user_labels.get(record.user_id, record.user_id or "—")
+                reason_text = self._format_skip_reason_summary(record.reasons)
+                lines.append(
+                    f"| `{record.chat_id}` | {label} | {record.skipped_images} | "
+                    f"{self._format_filesize(record.skipped_bytes)} | {reason_text or '—'} |"
+                )
 
         lines.append("")
         lines.append("All detached assets are now accessible via the standard `/api/v1/files/{id}/content` endpoint.")
         return "\n".join(lines)
+
+    def _format_skip_reason_summary(self, reasons: Dict[str, int]) -> str:
+        if not reasons:
+            return ""
+        labels = {
+            "unsupported_mime": "unsupported MIME type",
+            "decode_error": "invalid base64",
+            "empty_payload": "empty payload",
+            "storage_error": "storage backend error",
+            "db_error": "database insert error",
+            "persist_failed": "unknown error",
+        }
+        parts: List[str] = []
+        for key, count in sorted(reasons.items(), key=lambda item: (-item[1], item[0])):
+            friendly = labels.get(key, key.replace("_", " "))
+            parts.append(f"{count} {friendly}")
+        return ", ".join(parts)
 
     def _describe_counts(self, counts: Dict[str, int]) -> str:
         if not counts:

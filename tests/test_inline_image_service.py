@@ -28,7 +28,7 @@ def test_extract_inline_images_detects_data_uri():
 
 def test_replace_inline_images_uses_persisted_file(monkeypatch):
     service = InlineImageService()
-    monkeypatch.setattr(service, "_persist_inline_image", lambda user_id, mime, data: "file-123")
+    monkeypatch.setattr(service, "_persist_inline_image", lambda user_id, mime, data: ("file-123", None))
     text = f"example {_make_data_uri(b'payload', 'image/png')}"
     new_text, entries = service._replace_inline_images(text, "user-1")
     assert "file-123" in new_text
@@ -42,7 +42,22 @@ def test_bare_data_uri_detection(monkeypatch):
     uri = f"data:image/png;base64,{base}"
     matches = service._extract_inline_images(uri)
     assert len(matches) == 1
-    monkeypatch.setattr(service, "_persist_inline_image", lambda user_id, mime, data: "file-789")
+    monkeypatch.setattr(service, "_persist_inline_image", lambda user_id, mime, data: ("file-789", None))
     new_text, entries = service._replace_inline_images(uri, "user-9")
     assert new_text.endswith("/api/v1/files/file-789/content")
     assert entries[0]["file_id"] == "file-789"
+
+
+def test_replace_inline_images_tracks_skipped_entries(monkeypatch):
+    service = InlineImageService()
+
+    def _fake_store(user_id, mime, data):
+        return None, "decode_error"
+
+    monkeypatch.setattr(service, "_persist_inline_image", _fake_store)
+    text = _make_data_uri(b"payload", "image/png")
+    new_text, entries = service._replace_inline_images(text, "user-1")
+    assert new_text == text  # nothing replaced
+    assert len(entries) == 1
+    assert entries[0]["status"] == "skipped"
+    assert entries[0]["reason"] == "decode_error"
