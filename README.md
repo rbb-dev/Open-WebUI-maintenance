@@ -37,7 +37,7 @@ Every scan produces detailed Markdown tables you can paste directly into change 
 | Database hygiene | `db-scan` | `db-clean-missing-files`, `db-clean-orphan-files` | 5 rows | Cross-checks uploaded files against your chats and knowledge bases to find orphans (no references) and ghosts (database entries with missing files). |
 | Storage hygiene | `storage-scan` | `storage-clean` | 5 rows | Walks your upload directory to find files on disk that don't have database records—often leftovers from interrupted uploads or manual file operations. |
 | Chat integrity | `chat-scan` | `chat-repair` | 5 rows | Identifies chats with broken Unicode (null bytes or corrupted characters) that cause database errors. Repair sanitizes them in place. |
-| Inline image cleanup | `image-scan` | `image-detach` | 5 users / 5 chats | Finds images embedded directly in chats and converts them to proper file attachments, freeing database space and enabling proper access control. |
+| Inline image cleanup | `image-scan` | `image-detach` | 5 users / 5 chats | Finds images embedded directly in chats and converts them to proper file attachments, freeing database space and making them manageable through standard file operations. |
 | User footprints | `user-report` | N/A | 0 (report for all users) | Shows each user's chat and file storage consumption in one table—useful for capacity planning or identifying high-usage accounts. |
 
 > **Default limit rationale:** every workflow starts with `limit=5` to limit the blast radius if an operator forgets to tighten the scope. Raise the limit only after validating the preview rows.
