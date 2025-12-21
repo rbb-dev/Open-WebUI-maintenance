@@ -1097,7 +1097,7 @@ class LocalStorageInventory(StorageInventory):
     def iter_objects(self) -> Iterator[DiskObject]:
         """Yield every file below `UPLOAD_DIR`, tagging derived UUIDs when found."""
         if not self.root.exists():
-            return iter(())
+            return
         for entry in self.root.rglob("*"):
             if not entry.is_file():
                 continue
@@ -1226,6 +1226,20 @@ class UploadAuditService:
     def __init__(self, chunk_size: int = 400):
         """Store chunk size used across every SQLAlchemy iterator."""
         self.chunk_size = max(50, chunk_size)
+
+    def _ensure_payload(self, payload: Any) -> Any:
+        """Coerce serialized chat payloads into JSON-compatible Python objects."""
+        if isinstance(payload, (dict, list, tuple)):
+            return payload
+        if isinstance(payload, str):
+            trimmed = payload.strip()
+            if trimmed.startswith("{") or trimmed.startswith("["):
+                try:
+                    return json.loads(payload)
+                except Exception:
+                    return payload
+            return payload
+        return payload
 
     def scan_db_orphans(
         self,
@@ -1367,7 +1381,7 @@ class UploadAuditService:
             if cancel_event and cancel_event.is_set():
                 break
             processed += 1
-            payload = getattr(row, "chat", {}) or {}
+            payload = self._ensure_payload(getattr(row, "chat", {}) or {})
             referenced.update(self._extract_file_ids_from_chat(payload))
             if processed % (self.chunk_size * 2) == 0:
                 emit("chats", f"Scanned {processed} chats for attachments")
@@ -1418,8 +1432,9 @@ class UploadAuditService:
                 return {}
         return {}
 
-    def _extract_file_ids_from_chat(self, payload: dict) -> Set[str]:
+    def _extract_file_ids_from_chat(self, payload: Any) -> Set[str]:
         """Collect file IDs from chat history payloads."""
+        payload = self._ensure_payload(payload)
         history = payload.get("history", {}) if isinstance(payload, dict) else {}
         messages = history.get("messages", {}) if isinstance(history, dict) else {}
         file_ids: Set[str] = set()
@@ -1476,6 +1491,7 @@ class Pipe:
     PIPE_NAME = "Open WebUI: Maintenance"
     MAX_TOKEN_LENGTH = 256  # Cap individual CLI tokens to avoid runaway payloads.
     MAX_OPTION_VALUE_LENGTH = 2048  # Guard against unbounded option values.
+    _REMOTE_PATH_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
     _QUOTE_TRANSLATION = str.maketrans(
         {
             "\u201c": '"',
@@ -1601,6 +1617,19 @@ class Pipe:
         self.upload_root = Path(UPLOAD_DIR).expanduser().resolve()
         self._apply_logging_valve()
 
+    def _sync_services_from_valves(self) -> None:
+        """Ensure long-lived services reflect the current valve values."""
+        try:
+            self.service.chunk_size = max(50, int(self.valves.DB_CHUNK_SIZE))
+        except Exception:
+            pass
+        try:
+            self.chat_service.chunk_size = max(50, int(self.valves.CHAT_DB_CHUNK_SIZE))
+            self.image_service.chunk_size = max(50, int(self.valves.CHAT_DB_CHUNK_SIZE))
+        except Exception:
+            pass
+        self._apply_logging_valve()
+
     def _apply_logging_valve(self) -> None:
         """Set the module log level according to the ENABLE_LOGGING valve."""
         level = logging.DEBUG if self.valves.ENABLE_LOGGING else logging.INFO
@@ -1619,6 +1648,7 @@ class Pipe:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> StreamingResponse | PlainTextResponse:
         """Parse the incoming chat message, execute the command, and stream the result."""
+        self._sync_services_from_valves()
         command_text = self._extract_prompt_text(body)
         if not command_text:
             return await self._respond(True, self._help_markdown(), body)
@@ -1971,7 +2001,18 @@ class Pipe:
                 if not entries:
                     scope = self._describe_scope(user_filter, file_ids)
                     return await self._respond(True, f"Every database record still has a matching file ({scope}).", body)
-                clean_result = await asyncio.to_thread(self._clean_db_entries, entries)
+                remote_entries = [entry for entry in entries if self._looks_like_remote_path(entry.get("path"))]
+                local_entries = [entry for entry in entries if entry not in remote_entries]
+                if not local_entries:
+                    scope = self._describe_scope(user_filter, file_ids)
+                    message = (
+                        "No deletions performed.\n\n"
+                        f"All {len(remote_entries)} missing-file rows use remote storage paths (e.g. `s3://...`), "
+                        "so this pipe cannot safely prove the binaries are gone.\n\n"
+                        f"Scope: {scope}\n"
+                    )
+                    return await self._respond(False, message, body)
+                clean_result = await asyncio.to_thread(self._clean_db_entries, local_entries, delete_storage=False)
                 scope = self._describe_scope(user_filter, file_ids)
                 user_labels = await self._resolve_user_labels(
                     [
@@ -1981,6 +2022,11 @@ class Pipe:
                     ]
                 )
                 message = self._build_clean_db_report(clean_result, scope, user_labels)
+                if remote_entries:
+                    message += (
+                        "\n\n"
+                        f"Note: skipped {len(remote_entries)} rows with remote storage paths (unable to verify missing binaries)."
+                    )
                 return await self._respond(True, message, body)
 
             if command == "db-clean-orphan-files":
@@ -2013,7 +2059,7 @@ class Pipe:
                         f"No orphaned uploads remain for {scope}.",
                         body,
                     )
-                clean_result = await asyncio.to_thread(self._clean_db_entries, entries)
+                clean_result = await asyncio.to_thread(self._clean_db_entries, entries, delete_storage=True)
                 scope = self._describe_scope(user_filter, file_ids)
                 user_labels = await self._resolve_user_labels(
                     [
@@ -2611,6 +2657,20 @@ class Pipe:
             raise ValueError("Path/prefix must stay within the upload directory.")
 
         return str(candidate)
+
+    def _looks_like_remote_path(self, value: Optional[str]) -> bool:
+        if not value:
+            return False
+        return bool(self._REMOTE_PATH_PATTERN.match(str(value).strip()))
+
+    @staticmethod
+    def _get_vector_db_client():  # pragma: no cover - optional depending on deployment
+        try:
+            from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
+
+            return VECTOR_DB_CLIENT
+        except Exception:
+            return None
 
     @staticmethod
     def _is_valid_uuid(value: str) -> bool:
@@ -3389,28 +3449,61 @@ class Pipe:
         rows = self._prepare_user_report_rows(users, usage, limit=limit)
         return self._render_user_report(rows)
 
-    def _clean_db_entries(self, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _clean_db_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        *,
+        delete_storage: bool,
+    ) -> Dict[str, Any]:
         deleted: List[str] = []
         deleted_entries: List[Dict[str, Any]] = []
         failed: List[Dict[str, str]] = []
+        warnings: List[Dict[str, str]] = []
         entries_by_id = {entry.get("file_id"): entry for entry in entries if entry.get("file_id")}
+        vector_client = self._get_vector_db_client()
         for entry in entries:
             file_id = entry.get("file_id")
             if not file_id:
                 continue
+            file_record = None
+            with contextlib.suppress(Exception):
+                file_record = Files.get_file_by_id(file_id)
+
+            if delete_storage:
+                target_path = None
+                if file_record is not None:
+                    target_path = getattr(file_record, "path", None)
+                if not target_path:
+                    target_path = entry.get("path")
+                if not target_path:
+                    failed.append({"file_id": file_id, "error": "Missing file path; cannot delete storage"})
+                    continue
+                try:
+                    Storage.delete_file(target_path)
+                except Exception as exc:
+                    failed.append({"file_id": file_id, "error": f"Storage delete failed: {exc}"})
+                    continue
+
             error: Optional[str] = None
             try:
                 result = Files.delete_file_by_id(file_id)
             except Exception as exc:
                 result = False
                 error = str(exc)
-            if result:
-                deleted.append(file_id)
-                if file_id in entries_by_id:
-                    deleted_entries.append(entries_by_id[file_id])
-            else:
-                failed.append({"file_id": file_id, "error": error or "Delete failed"})
-        return {"deleted": deleted, "deleted_entries": deleted_entries, "failed": failed}
+            if not result:
+                failed.append({"file_id": file_id, "error": error or "Database delete failed"})
+                continue
+
+            if vector_client is not None:
+                try:
+                    vector_client.delete(collection_name=f"file-{file_id}")
+                except Exception as exc:
+                    warnings.append({"file_id": file_id, "warning": f"Vector cleanup failed: {exc}"})
+
+            deleted.append(file_id)
+            if file_id in entries_by_id:
+                deleted_entries.append(entries_by_id[file_id])
+        return {"deleted": deleted, "deleted_entries": deleted_entries, "failed": failed, "warnings": warnings}
 
     def _clean_storage_entries(
         self,
@@ -3447,6 +3540,9 @@ class Pipe:
         lines.append(f"- Scope: {scope}")
         lines.append(f"- Database records removed: {len(result['deleted'])}")
         lines.append(f"- Failures: {len(result['failed'])}")
+        warnings = result.get("warnings") or []
+        if warnings:
+            lines.append(f"- Warnings: {len(warnings)}")
         if result["deleted"]:
             lines.append("- File IDs removed: " + ", ".join(f"`{fid}`" for fid in result["deleted"]))
         if result["failed"]:
@@ -3455,6 +3551,12 @@ class Pipe:
             lines.append("| --- | --- |")
             for row in result["failed"]:
                 lines.append(f"| `{row['file_id']}` | {row['error']} |")
+        if warnings:
+            lines.append("\n#### Warnings")
+            lines.append("| File ID | Warning |")
+            lines.append("| --- | --- |")
+            for row in warnings:
+                lines.append(f"| `{row['file_id']}` | {row['warning']} |")
         deleted_entries = result.get("deleted_entries", [])
         if deleted_entries:
             lines.append("\n#### Deleted records")
