@@ -5,3 +5,8 @@ __pycache__/
 .pytest_cache/
 *.tmp
 *.TMP
+.coverage
+coverage.xml
+htmlcov/
+backups/
+.tmp_uploads/
