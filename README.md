@@ -1,3 +1,5 @@
+# Warning. with new version of Open-WebUI, you no longer need to clean files/storage. OWUI now tracks the file/storage usage with a new sql table.
+
 # Open WebUI Maintenance Pipe
 
 Open WebUI deployments naturally accumulate data over time: uploaded files, chat histories, and embedded images. This maintenance pipe transforms an ordinary chat conversation into a full-featured operations console, letting administrators audit storage, repair corrupted data, and clean up orphaned files—all without leaving the chat interface or touching the command line.
